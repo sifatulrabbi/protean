@@ -1,0 +1,28 @@
+{
+  "name": "@protean/model-catalog",
+  "private": true,
+  "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "build": "echo 'No build step'",
+    "typecheck": "bunx tsc --noEmit",
+    "test": "bun test src",
+    "fetch-catalog": "bun run scripts/fetch-catalog.ts",
+    "convert-catalog": "bun run scripts/convert-catalog.ts"
+  },
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.9",
+    "@types/node": "^25.2.3",
+    "typescript": "^5.9.3"
+  }
+}

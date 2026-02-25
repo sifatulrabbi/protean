@@ -1,0 +1,19 @@
+{
+  "name": "protean",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "start": "bun run --cwd apps/webapp start",
+    "dev": "bun run --cwd apps/webapp dev",
+    "typecheck": "bun run --filter \"packages/*\" --if-present typecheck && bun run --filter \"apps/tui\" --if-present typecheck",
+    "build": "bun run --filter \"packages/*\" --if-present build && bun run --filter \"apps/tui\" --if-present build",
+    "lint": "bun run --cwd packages/protean lint && bun run --cwd apps/tui lint && bun run --cwd apps/webapp lint",
+    "test": "bun run --filter \"packages/*\" --if-present test && bun run --filter \"apps/tui\" --if-present test",
+    "test:integration": "bun run --cwd packages/protean test:integration",
+    "dev:vfs": "cd apps/vfs-server && make dev",
+    "format": "bunx prettier --write ./*"
+  }
+}

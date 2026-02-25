@@ -1,0 +1,15 @@
+services:
+  vfs-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    ports:
+      - "${PORT:-8090}:${PORT:-8090}"
+    volumes:
+      # Bind mount the host path from .env to /workspace inside the container
+      - ${VFS_WORKSPACE_BASE:?Set VFS_WORKSPACE_BASE in .env}:/workspace
+    environment:
+      # Override: inside the container the workspace is always /workspace
+      VFS_WORKSPACE_BASE: /workspace
+    restart: unless-stopped
