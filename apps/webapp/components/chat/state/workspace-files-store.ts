@@ -2,7 +2,7 @@
 
 import { create } from "zustand";
 import type { FileEntry } from "@/components/chat/file-entry-context-menu";
-import type { WorkspaceFilesState } from "@/components/chat/state/types";
+import type { StorageType, WorkspaceFilesState } from "@/components/chat/state/types";
 
 interface WorkspaceFilesStore extends WorkspaceFilesState {
   closeRename: () => void;
@@ -15,6 +15,7 @@ interface WorkspaceFilesStore extends WorkspaceFilesState {
   setEntries: (entries: FileEntry[]) => void;
   setError: (error: string | null) => void;
   setLoading: (loading: boolean) => void;
+  setStorageType: (storageType: StorageType) => void;
 }
 
 const initialState: WorkspaceFilesState = {
@@ -23,6 +24,7 @@ const initialState: WorkspaceFilesState = {
   error: null,
   loading: false,
   renameEntry: null,
+  storageType: "cloud",
   viewerFile: null,
 };
 
@@ -57,4 +59,7 @@ export const useWorkspaceFilesStore = create<WorkspaceFilesStore>()((set) => ({
   setError: (error) => set({ error }),
 
   setLoading: (loading) => set({ loading }),
+
+  setStorageType: (storageType) =>
+    set({ storageType, currentDir: "/", entries: [], error: null }),
 }));

@@ -59,11 +59,14 @@ export interface ThreadsSidebarState {
   threadItems: ThreadRecordTrimmed[];
 }
 
+export type StorageType = "cloud" | "local";
+
 export interface WorkspaceFilesState {
   currentDir: string;
   entries: FileEntry[];
   error: string | null;
   loading: boolean;
   renameEntry: FileEntry | null;
+  storageType: StorageType;
   viewerFile: FileEntry | null;
 }

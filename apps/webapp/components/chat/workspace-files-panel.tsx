@@ -3,8 +3,10 @@
 import { useEffect, useRef } from "react";
 import {
   ArrowLeftIcon,
+  CloudIcon,
   FileIcon,
   FolderIcon,
+  HardDriveIcon,
   RefreshCwIcon,
 } from "lucide-react";
 
@@ -18,6 +20,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Sidebar,
   SidebarContent,
@@ -34,6 +43,7 @@ import {
   type FileEntry,
 } from "@/components/chat/file-entry-context-menu";
 import { useWorkspaceFilesStore } from "@/components/chat/state/workspace-files-store";
+import type { StorageType } from "@/components/chat/state/types";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -115,16 +125,22 @@ export function WorkspaceFilesPanel() {
   const entries = useWorkspaceFilesStore((state) => state.entries);
   const error = useWorkspaceFilesStore((state) => state.error);
   const loading = useWorkspaceFilesStore((state) => state.loading);
+  const storageType = useWorkspaceFilesStore((state) => state.storageType);
   const viewerFile = useWorkspaceFilesStore((state) => state.viewerFile);
   const renameEntry = useWorkspaceFilesStore((state) => state.renameEntry);
   const navigateUp = useWorkspaceFilesStore((state) => state.navigateUp);
   const openRename = useWorkspaceFilesStore((state) => state.openRename);
   const closeRename = useWorkspaceFilesStore((state) => state.closeRename);
   const closeViewer = useWorkspaceFilesStore((state) => state.closeViewer);
+  const setStorageType = useWorkspaceFilesStore(
+    (state) => state.setStorageType,
+  );
 
   useEffect(() => {
-    void refreshEntries(currentDir);
-  }, [currentDir, refreshEntries]);
+    if (storageType === "cloud") {
+      void refreshEntries(currentDir);
+    }
+  }, [currentDir, refreshEntries, storageType]);
 
   function handleOpen(entry: FileEntry) {
     openEntry(entry);
@@ -143,91 +159,125 @@ export function WorkspaceFilesPanel() {
     <>
       <Sidebar side="right" collapsible="offcanvas">
         <SidebarHeader className="border-b px-3 py-2">
-          <div className="flex items-center gap-2">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={navigateUp}
-              disabled={currentDir === "/"}
-              className="size-7 p-0"
-            >
-              <ArrowLeftIcon className="size-4" />
-              <span className="sr-only">Go back</span>
-            </Button>
+          <Select
+            value={storageType}
+            onValueChange={(value: StorageType) => setStorageType(value)}
+          >
+            <SelectTrigger size="sm" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start">
+              <SelectItem value="cloud">
+                <CloudIcon className="size-4" />
+                Cloud storage
+              </SelectItem>
+              <SelectItem value="local">
+                <HardDriveIcon className="size-4" />
+                Local storage
+              </SelectItem>
+            </SelectContent>
+          </Select>
 
-            <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">
-              /{currentDir === "/" ? "" : currentDir}
-            </span>
+          {storageType === "cloud" && (
+            <div className="flex items-center gap-2">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={navigateUp}
+                disabled={currentDir === "/"}
+                className="size-7 p-0"
+              >
+                <ArrowLeftIcon className="size-4" />
+                <span className="sr-only">Go back</span>
+              </Button>
 
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => {
-                void refreshEntries(currentDir);
-              }}
-              className="size-7 p-0"
-            >
-              <RefreshCwIcon className="size-4" />
-              <span className="sr-only">Refresh</span>
-            </Button>
-          </div>
+              <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">
+                /{currentDir === "/" ? "" : currentDir}
+              </span>
+
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  void refreshEntries(currentDir);
+                }}
+                className="size-7 p-0"
+              >
+                <RefreshCwIcon className="size-4" />
+                <span className="sr-only">Refresh</span>
+              </Button>
+            </div>
+          )}
         </SidebarHeader>
 
         <SidebarContent>
-          <SidebarGroup>
-            <SidebarGroupContent>
-              {loading && (
-                <p className="py-8 text-center text-sm text-muted-foreground">
-                  Loading...
-                </p>
-              )}
+          {storageType === "cloud" ? (
+            <SidebarGroup>
+              <SidebarGroupContent>
+                {loading && (
+                  <p className="py-8 text-center text-sm text-muted-foreground">
+                    Loading...
+                  </p>
+                )}
 
-              {error ? (
-                <p className="px-2 py-3 text-center text-destructive text-xs">
-                  {error}
-                </p>
-              ) : null}
+                {error ? (
+                  <p className="px-2 py-3 text-center text-destructive text-xs">
+                    {error}
+                  </p>
+                ) : null}
 
-              {!loading && entries.length === 0 && (
-                <p className="py-8 text-center text-sm text-muted-foreground">
-                  No files found
-                </p>
-              )}
+                {!loading && entries.length === 0 && (
+                  <p className="py-8 text-center text-sm text-muted-foreground">
+                    No files found
+                  </p>
+                )}
 
-              {!loading && entries.length > 0 && (
-                <SidebarMenu>
-                  {entries.map((entry) => (
-                    <SidebarMenuItem key={entry.path}>
-                      <FileEntryContextMenu
-                        entry={entry}
-                        onOpen={handleOpen}
-                        onDownload={downloadEntry}
-                        onAddToChat={handleAddToChat}
-                        onDelete={(nextEntry) => {
-                          void deleteEntry(nextEntry);
-                        }}
-                        onRename={handleRenameRequest}
-                      >
-                        <SidebarMenuButton onClick={() => handleOpen(entry)}>
-                          {entry.isDirectory ? (
-                            <FolderIcon className="size-4" />
-                          ) : (
-                            <FileIcon className="size-4" />
-                          )}
-                          <span className="truncate">{entry.name}</span>
-                          {!entry.isDirectory ? (
-                            <span className="ml-auto shrink-0 text-xs text-muted-foreground">
-                              {formatBytes(entry.size)}
-                            </span>
-                          ) : null}
-                        </SidebarMenuButton>
-                      </FileEntryContextMenu>
-                    </SidebarMenuItem>
-                  ))}
-                </SidebarMenu>
-              )}
-            </SidebarGroupContent>
-          </SidebarGroup>
+                {!loading && entries.length > 0 && (
+                  <SidebarMenu>
+                    {entries.map((entry) => (
+                      <SidebarMenuItem key={entry.path}>
+                        <FileEntryContextMenu
+                          entry={entry}
+                          onOpen={handleOpen}
+                          onDownload={downloadEntry}
+                          onAddToChat={handleAddToChat}
+                          onDelete={(nextEntry) => {
+                            void deleteEntry(nextEntry);
+                          }}
+                          onRename={handleRenameRequest}
+                        >
+                          <SidebarMenuButton onClick={() => handleOpen(entry)}>
+                            {entry.isDirectory ? (
+                              <FolderIcon className="size-4" />
+                            ) : (
+                              <FileIcon className="size-4" />
+                            )}
+                            <span className="truncate">{entry.name}</span>
+                            {!entry.isDirectory ? (
+                              <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+                                {formatBytes(entry.size)}
+                              </span>
+                            ) : null}
+                          </SidebarMenuButton>
+                        </FileEntryContextMenu>
+                      </SidebarMenuItem>
+                    ))}
+                  </SidebarMenu>
+                )}
+              </SidebarGroupContent>
+            </SidebarGroup>
+          ) : (
+            <div className="flex flex-1 flex-col items-center justify-center gap-2 px-4 py-12">
+              <p className="text-xl font-bold text-muted-foreground/50">
+                Coming soon!
+              </p>
+              <HardDriveIcon className="size-8 text-muted-foreground/50" />
+              <p className="text-center text-sm text-muted-foreground">
+                Let the browser agent work on your computer!
+                <br />
+              </p>
+            </div>
+          )}
         </SidebarContent>
       </Sidebar>
 
