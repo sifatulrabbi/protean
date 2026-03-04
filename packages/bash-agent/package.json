@@ -12,6 +12,7 @@
   },
   "scripts": {
     "build": "echo 'No build step'",
+    "cli": "bun run ./src/cli.ts",
     "typecheck": "bunx tsc --noEmit",
     "test": "bun test src",
     "lint": "bunx eslint . --ext .ts"
@@ -21,10 +22,12 @@
     "@protean/agent-memory": "workspace:*",
     "@protean/model-catalog": "workspace:*",
     "@protean/logger": "workspace:*",
+    "@protean/sandbox-client": "workspace:*",
     "@protean/utils": "workspace:*",
     "@protean/vfs": "workspace:*",
     "@tavily/ai-sdk": "^0.4.1",
     "ai": "^6.0.78",
+    "dotenv": "^17.2.3",
     "zod": "^4.3.6"
   },
   "devDependencies": {

@@ -13,23 +13,46 @@ import {
 } from "@protean/agent-memory";
 import { consoleLogger, type Logger } from "@protean/logger";
 import { findModel } from "@protean/model-catalog";
+import { createSandboxClient } from "@protean/sandbox-client";
 
 import { createAgent } from "./base-agent";
-import { createBashTools } from "./bash-tools";
-import { createFsTools } from "./fs-tools";
+import {
+  createBashTools,
+  shellQuote,
+  type ShellRunner,
+  type ShellRunnerInput,
+} from "./bash-tools";
+import { createFsTools, type Globber } from "./fs-tools";
 import { createModelFromSelection } from "./model-provider";
 import { buildBashAgentPrompt } from "./prompt";
+import {
+  resolveWithinWorkspace,
+  toWorkspaceRelativePath,
+} from "./workspace-paths";
+
+export interface LocalBashEnvironment {
+  kind: "local";
+  workspaceRoot: string;
+  allowEnvKeys?: string[];
+}
+
+export interface SandboxBashEnvironment {
+  kind: "sandbox";
+  serviceBaseUrl: string;
+  serviceToken: string;
+  sessionId: string;
+  workspaceRoot?: string;
+}
 
 export interface BashAgentOptions {
   threadId: string;
   memory: AgentMemory;
-  workspaceRoot: string;
+  environment: LocalBashEnvironment | SandboxBashEnvironment;
   cwd?: string;
   instructions?: string;
   maxSteps?: number;
   bashTimeoutMs?: number;
   maxOutputBytes?: number;
-  allowEnvKeys?: string[];
   modelOverride?: LanguageModel;
 }
 
@@ -106,6 +129,74 @@ function normalizeUsage(
   };
 }
 
+function buildSandboxGlobber(
+  workspaceRoot: string,
+  runner: ShellRunner,
+  timeoutMs: number,
+  maxOutputBytes: number,
+): Globber {
+  const pythonScript = `import glob, os, sys
+
+pattern = sys.argv[1]
+include_dirs = sys.argv[2] == "1"
+
+limit = int(sys.argv[3])
+seen = set()
+count = 0
+
+for match in glob.iglob(pattern, recursive=True):
+    normalized = match.replace("\\\\", "/")
+
+    if not include_dirs and os.path.isdir(match):
+        continue
+
+    if normalized in seen:
+        continue
+
+    print(normalized)
+    seen.add(normalized)
+    count += 1
+
+    if count >= limit:
+        break
+`;
+
+  return {
+    glob: async ({ pattern, cwd, includeDirectories, maxResults }) => {
+      const result = await runner.exec({
+        command: [
+          "python3",
+          "-c",
+          shellQuote(pythonScript),
+          shellQuote(pattern),
+          includeDirectories ? "1" : "0",
+          String(maxResults),
+        ].join(" "),
+        cwd,
+        timeoutMs,
+        maxOutputBytes,
+      });
+
+      if (result.exitCode !== 0) {
+        const stderr = result.stderr.trim();
+        throw new Error(stderr || "Sandbox glob failed.");
+      }
+
+      const cwdAbsolute = resolveWithinWorkspace(workspaceRoot, cwd);
+      return result.stdout
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) =>
+          toWorkspaceRelativePath(
+            workspaceRoot,
+            resolveWithinWorkspace(cwdAbsolute, line),
+          ),
+        );
+    },
+  };
+}
+
 export async function createBashAgent(
   opts: BashAgentOptions,
   logger: Logger = consoleLogger,
@@ -132,24 +223,82 @@ export async function createBashAgent(
   const model =
     opts.modelOverride ?? createModelFromSelection(thread.modelSelection).model;
 
-  const fsTools = await createFsTools(
-    {
-      workspaceRoot: opts.workspaceRoot,
-      cwd: opts.cwd,
-      maxReadBytes: opts.maxOutputBytes,
-    },
-    logger,
-  );
-  const bashTools = await createBashTools(
-    {
-      workspaceRoot: opts.workspaceRoot,
-      cwd: opts.cwd,
-      timeoutMs: opts.bashTimeoutMs,
-      maxOutputBytes: opts.maxOutputBytes,
-      allowEnvKeys: opts.allowEnvKeys,
-    },
-    logger,
-  );
+  const defaultTimeoutMs = opts.bashTimeoutMs ?? 30_000;
+  const maxOutputBytes = opts.maxOutputBytes ?? 64 * 1024;
+  let shellRunner: ShellRunner | undefined;
+  let globber: Globber | undefined;
+  let fsTools: Record<string, Tool>;
+  let bashTools: Record<string, Tool>;
+  let workspaceRoot: string;
+
+  if (opts.environment.kind === "sandbox") {
+    const sandboxClient = await createSandboxClient({
+      baseUrl: opts.environment.serviceBaseUrl,
+      serviceToken: opts.environment.serviceToken,
+      sessionId: opts.environment.sessionId,
+      logger,
+    });
+    workspaceRoot =
+      opts.environment.workspaceRoot ?? sandboxClient.workspaceMountPath;
+
+    shellRunner = {
+      exec: async ({ command, cwd, timeoutMs }: ShellRunnerInput) =>
+        sandboxClient.exec({
+          command,
+          cwd,
+          timeoutMs,
+        }),
+    };
+
+    globber = buildSandboxGlobber(
+      workspaceRoot,
+      shellRunner,
+      defaultTimeoutMs,
+      maxOutputBytes,
+    );
+
+    fsTools = await createFsTools(
+      {
+        workspaceRoot,
+        fs: sandboxClient.fs,
+        cwd: opts.cwd,
+        maxReadBytes: opts.maxOutputBytes,
+        globber,
+      },
+      logger,
+    );
+    bashTools = await createBashTools(
+      {
+        workspaceRoot,
+        cwd: opts.cwd,
+        timeoutMs: opts.bashTimeoutMs,
+        maxOutputBytes: opts.maxOutputBytes,
+        runner: shellRunner,
+      },
+      logger,
+    );
+  } else {
+    workspaceRoot = opts.environment.workspaceRoot;
+    fsTools = await createFsTools(
+      {
+        workspaceRoot,
+        cwd: opts.cwd,
+        maxReadBytes: opts.maxOutputBytes,
+      },
+      logger,
+    );
+    bashTools = await createBashTools(
+      {
+        workspaceRoot,
+        cwd: opts.cwd,
+        timeoutMs: opts.bashTimeoutMs,
+        maxOutputBytes: opts.maxOutputBytes,
+        allowEnvKeys: opts.environment.allowEnvKeys,
+      },
+      logger,
+    );
+  }
+
   const tools = {
     ...fsTools,
     ...bashTools,
@@ -159,7 +308,7 @@ export async function createBashAgent(
     name: "bash-agent",
     model,
     tools,
-    instructions: opts.instructions ?? buildBashAgentPrompt(opts.workspaceRoot),
+    instructions: opts.instructions ?? buildBashAgentPrompt(workspaceRoot),
     maxSteps: opts.maxSteps,
   });
 

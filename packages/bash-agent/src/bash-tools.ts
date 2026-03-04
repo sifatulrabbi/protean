@@ -14,14 +14,26 @@ export interface BashToolsOptions {
   timeoutMs?: number;
   maxOutputBytes?: number;
   allowEnvKeys?: string[];
+  runner?: ShellRunner;
 }
 
-interface CommandResult {
+export interface CommandResult {
   exitCode: number;
   stdout: string;
   stderr: string;
   timedOut: boolean;
   signalCode: string | null;
+}
+
+export interface ShellRunnerInput {
+  command: string;
+  cwd: string;
+  timeoutMs: number;
+  maxOutputBytes: number;
+}
+
+export interface ShellRunner {
+  exec(input: ShellRunnerInput): Promise<CommandResult>;
 }
 
 function truncateText(
@@ -50,7 +62,7 @@ function truncateText(
   };
 }
 
-function shellQuote(value: string): string {
+export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
@@ -68,7 +80,7 @@ function buildEnv(allowEnvKeys: string[]): Record<string, string> {
   return env;
 }
 
-function resolveCommandCwd(
+export function resolveCommandCwd(
   workspaceRoot: string,
   baseCwd: string,
   commandCwd?: string,
@@ -88,55 +100,64 @@ async function readStream(stream: ReadableStream<Uint8Array> | null) {
   return new Response(stream).text();
 }
 
-async function runCommand(
-  command: string,
-  opts: {
-    cwd: string;
-    timeoutMs: number;
-    maxOutputBytes: number;
-    allowEnvKeys: string[];
-  },
-): Promise<CommandResult> {
-  const controller = new AbortController();
-  let timedOut = false;
+function createLocalShellRunner(opts: {
+  workspaceRoot: string;
+  allowEnvKeys: string[];
+}): ShellRunner {
+  return {
+    exec: async ({
+      command,
+      cwd,
+      timeoutMs,
+      maxOutputBytes,
+    }): Promise<CommandResult> => {
+      const absoluteCwd = resolveWithinWorkspace(opts.workspaceRoot, cwd);
+      const controller = new AbortController();
+      let timedOut = false;
 
-  const timeout = setTimeout(() => {
-    timedOut = true;
-    controller.abort("timeout");
-  }, opts.timeoutMs);
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort("timeout");
+      }, timeoutMs);
 
-  const proc = Bun.spawn({
-    cmd: ["bash", "-lc", command],
-    cwd: opts.cwd,
-    stdout: "pipe",
-    stderr: "pipe",
-    env: buildEnv(opts.allowEnvKeys),
-    signal: controller.signal,
-  });
+      const proc = Bun.spawn({
+        cmd: ["bash", "-lc", command],
+        cwd: absoluteCwd,
+        stdout: "pipe",
+        stderr: "pipe",
+        env: buildEnv(opts.allowEnvKeys),
+        signal: controller.signal,
+      });
 
-  try {
-    const [stdout, stderr] = await Promise.all([
-      readStream(proc.stdout),
-      readStream(proc.stderr),
-    ]);
+      try {
+        const [stdout, stderr] = await Promise.all([
+          readStream(proc.stdout),
+          readStream(proc.stderr),
+        ]);
 
-    const exitCode = await proc.exited;
-    const truncatedStdout = truncateText(stdout, opts.maxOutputBytes);
-    const truncatedStderr = truncateText(stderr, opts.maxOutputBytes);
+        const exitCode = await proc.exited;
+        const truncatedStdout = truncateText(stdout, maxOutputBytes);
+        const truncatedStderr = truncateText(stderr, maxOutputBytes);
 
-    return {
-      exitCode,
-      stdout: truncatedStdout.text,
-      stderr: truncatedStderr.text,
-      timedOut,
-      signalCode: proc.signalCode ?? null,
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
+        return {
+          exitCode,
+          stdout: truncatedStdout.text,
+          stderr: truncatedStderr.text,
+          timedOut,
+          signalCode: proc.signalCode ?? null,
+        };
+      } finally {
+        clearTimeout(timeout);
+      }
+    },
+  };
 }
 
-function parseRipgrepJson(output: string, workspaceRoot: string) {
+function parseRipgrepJson(
+  output: string,
+  commandRoot: string,
+  workspaceRoot: string,
+) {
   const matches: Array<{
     path: string;
     line: number;
@@ -180,7 +201,7 @@ function parseRipgrepJson(output: string, workspaceRoot: string) {
       continue;
     }
 
-    const absolutePath = resolveWithinWorkspace(workspaceRoot, data.path.text);
+    const absolutePath = resolveWithinWorkspace(commandRoot, data.path.text);
     matches.push({
       path: toWorkspaceRelativePath(workspaceRoot, absolutePath),
       line: data.line_number,
@@ -195,7 +216,11 @@ function parseRipgrepJson(output: string, workspaceRoot: string) {
   return matches;
 }
 
-function parseGrepLines(output: string, workspaceRoot: string) {
+function parseGrepLines(
+  output: string,
+  commandRoot: string,
+  workspaceRoot: string,
+) {
   const matches: Array<{
     path: string;
     line: number;
@@ -210,7 +235,7 @@ function parseGrepLines(output: string, workspaceRoot: string) {
     }
 
     const [, filePath, lineNumber, text] = match;
-    const absolutePath = resolveWithinWorkspace(workspaceRoot, filePath);
+    const absolutePath = resolveWithinWorkspace(commandRoot, filePath);
     matches.push({
       path: toWorkspaceRelativePath(workspaceRoot, absolutePath),
       line: Number(lineNumber),
@@ -227,6 +252,21 @@ export async function createBashTools(opts: BashToolsOptions, logger: Logger) {
   const defaultTimeoutMs = opts.timeoutMs ?? 30_000;
   const maxOutputBytes = opts.maxOutputBytes ?? 64 * 1024;
   const allowEnvKeys = opts.allowEnvKeys ?? [];
+  const runner =
+    opts.runner ??
+    createLocalShellRunner({
+      workspaceRoot: opts.workspaceRoot,
+      allowEnvKeys,
+    });
+
+  // Check rg availability once at init, not on every Grep call.
+  const rgCheck = await runner.exec({
+    command: "command -v rg >/dev/null 2>&1",
+    cwd: ".",
+    timeoutMs: defaultTimeoutMs,
+    maxOutputBytes,
+  });
+  const rgAvailable = rgCheck.exitCode === 0;
 
   const Bash = tool({
     description:
@@ -249,17 +289,18 @@ export async function createBashTools(opts: BashToolsOptions, logger: Logger) {
           defaultCwd,
           cwd,
         );
-        const result = await runCommand(command, {
-          cwd: commandCwd,
+        const cwdRelative = toWorkspaceRelativePath(opts.workspaceRoot, commandCwd);
+        const result = await runner.exec({
+          command,
+          cwd: cwdRelative,
           timeoutMs: timeoutMs ?? defaultTimeoutMs,
           maxOutputBytes,
-          allowEnvKeys,
         });
 
         return {
           ok: result.exitCode === 0 && !result.timedOut,
           ...result,
-          cwd: toWorkspaceRelativePath(opts.workspaceRoot, commandCwd),
+          cwd: cwdRelative,
         };
       } catch (error) {
         const nextError =
@@ -302,14 +343,9 @@ export async function createBashTools(opts: BashToolsOptions, logger: Logger) {
           defaultCwd,
           path ?? ".",
         );
-        const rgCheck = await runCommand("command -v rg >/dev/null 2>&1", {
-          cwd: commandCwd,
-          timeoutMs: defaultTimeoutMs,
-          maxOutputBytes,
-          allowEnvKeys,
-        });
+        const cwdRelative = toWorkspaceRelativePath(opts.workspaceRoot, commandCwd);
 
-        if (rgCheck.exitCode === 0) {
+        if (rgAvailable) {
           const rgParts = [
             "rg",
             "--json",
@@ -327,15 +363,16 @@ export async function createBashTools(opts: BashToolsOptions, logger: Logger) {
           }
           rgParts.push(shellQuote(pattern), ".");
 
-          const rgResult = await runCommand(rgParts.join(" "), {
-            cwd: commandCwd,
+          const rgResult = await runner.exec({
+            command: rgParts.join(" "),
+            cwd: cwdRelative,
             timeoutMs: defaultTimeoutMs,
             maxOutputBytes,
-            allowEnvKeys,
           });
 
           const matches = parseRipgrepJson(
             rgResult.stdout,
+            commandCwd,
             opts.workspaceRoot,
           ).slice(0, maxResults);
 
@@ -356,20 +393,21 @@ export async function createBashTools(opts: BashToolsOptions, logger: Logger) {
         }
         grepParts.push(shellQuote(pattern), ".");
 
-        const grepResult = await runCommand(grepParts.join(" "), {
-          cwd: commandCwd,
+        const grepResult = await runner.exec({
+          command: grepParts.join(" "),
+          cwd: cwdRelative,
           timeoutMs: defaultTimeoutMs,
           maxOutputBytes,
-          allowEnvKeys,
         });
 
         return {
           ok: grepResult.exitCode === 0 || grepResult.exitCode === 1,
           engine: "grep",
-          matches: parseGrepLines(grepResult.stdout, opts.workspaceRoot).slice(
-            0,
-            maxResults,
-          ),
+          matches: parseGrepLines(
+            grepResult.stdout,
+            commandCwd,
+            opts.workspaceRoot,
+          ).slice(0, maxResults),
           stderr: grepResult.stderr,
         };
       } catch (error) {

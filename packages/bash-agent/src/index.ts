@@ -6,10 +6,17 @@ export type {
   BashAgentOptions,
   BashAgentRunResult,
   BashAgentInstance,
+  LocalBashEnvironment,
+  SandboxBashEnvironment,
 } from "./bash-agent";
 
 export { createBashTools } from "./bash-tools";
-export type { BashToolsOptions } from "./bash-tools";
+export type {
+  BashToolsOptions,
+  ShellRunner,
+  ShellRunnerInput,
+  CommandResult,
+} from "./bash-tools";
 
 export { createFsTools } from "./fs-tools";
-export type { FsToolsOptions } from "./fs-tools";
+export type { FsToolsOptions, Globber } from "./fs-tools";

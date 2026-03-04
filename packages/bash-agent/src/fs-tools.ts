@@ -1,20 +1,31 @@
-import { join } from "node:path";
 import { tool } from "ai";
 import type { Logger } from "@protean/logger";
-import { createLocalFs } from "@protean/vfs";
+import { createLocalFs, type FS } from "@protean/vfs";
 import { tryCatch } from "@protean/utils";
 import { z } from "zod";
 
+import { resolveCommandCwd } from "./bash-tools";
 import {
   resolveWithinWorkspace,
   toWorkspaceRelativePath,
 } from "./workspace-paths";
 
+export interface Globber {
+  glob(input: {
+    pattern: string;
+    cwd: string;
+    includeDirectories: boolean;
+    maxResults: number;
+  }): Promise<string[]>;
+}
+
 export interface FsToolsOptions {
   workspaceRoot: string;
+  fs?: FS;
   cwd?: string;
   maxReadBytes?: number;
   maxReadLines?: number;
+  globber?: Globber;
 }
 
 function successResult<T extends Record<string, unknown>>(
@@ -29,26 +40,14 @@ function successResult<T extends Record<string, unknown>>(
 }
 
 function failureResult<T extends Record<string, unknown>>(
-  error: Error,
+  error: string | Error,
   result: T,
 ): T & { ok: false; error: string } {
   return {
     ok: false,
-    error: error.message,
+    error: typeof error === "string" ? error : error.message,
     ...result,
   };
-}
-
-function resolveToolPath(
-  workspaceRoot: string,
-  cwd: string,
-  targetPath?: string,
-): string {
-  const resolvedCwd = resolveWithinWorkspace(workspaceRoot, cwd);
-  return resolveWithinWorkspace(
-    workspaceRoot,
-    targetPath ? join(resolvedCwd, targetPath) : resolvedCwd,
-  );
 }
 
 function countOccurrences(content: string, oldString: string): number {
@@ -73,11 +72,36 @@ function withLineNumbers(lines: string[], startLine: number): string {
   return lines.map((line, index) => `${startLine + index}: ${line}`).join("\n");
 }
 
+function createLocalGlobber(workspaceRoot: string): Globber {
+  return {
+    glob: async ({ pattern, cwd, includeDirectories, maxResults }) => {
+      const absoluteCwd = resolveWithinWorkspace(workspaceRoot, cwd);
+      const results: string[] = [];
+      const glob = new Bun.Glob(pattern);
+
+      for await (const match of glob.scan({
+        cwd: absoluteCwd,
+        absolute: false,
+        onlyFiles: !includeDirectories,
+      })) {
+        const absoluteMatch = resolveWithinWorkspace(absoluteCwd, match);
+        results.push(toWorkspaceRelativePath(workspaceRoot, absoluteMatch));
+        if (results.length >= maxResults) {
+          break;
+        }
+      }
+
+      return [...new Set(results)];
+    },
+  };
+}
+
 export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
-  const fsClient = await createLocalFs(opts.workspaceRoot, logger);
+  const fsClient = opts.fs ?? (await createLocalFs(opts.workspaceRoot, logger));
   const defaultCwd = opts.cwd ?? ".";
   const maxReadBytes = opts.maxReadBytes ?? 64 * 1024;
   const maxReadLines = opts.maxReadLines ?? 2_000;
+  const globber = opts.globber ?? createLocalGlobber(opts.workspaceRoot);
 
   const ListDir = tool({
     description:
@@ -95,7 +119,7 @@ export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
         maxDepth,
       });
 
-      const resolvedBase = resolveToolPath(
+      const resolvedBase = resolveCommandCwd(
         opts.workspaceRoot,
         defaultCwd,
         basePath,
@@ -152,12 +176,12 @@ export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
         destinationPath,
       });
 
-      const sourceAbs = resolveToolPath(
+      const sourceAbs = resolveCommandCwd(
         opts.workspaceRoot,
         defaultCwd,
         sourcePath,
       );
-      const destinationAbs = resolveToolPath(
+      const destinationAbs = resolveCommandCwd(
         opts.workspaceRoot,
         defaultCwd,
         destinationPath,
@@ -208,7 +232,7 @@ export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
         endLine,
       });
 
-      const absolutePath = resolveToolPath(
+      const absolutePath = resolveCommandCwd(
         opts.workspaceRoot,
         defaultCwd,
         path,
@@ -225,22 +249,18 @@ export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
       }
 
       if (Buffer.byteLength(content, "utf8") > maxReadBytes) {
-        return {
-          ok: false as const,
-          error: `File exceeds max readable size of ${maxReadBytes} bytes.`,
-          path,
-          content: "",
-        };
+        return failureResult(
+          `File exceeds max readable size of ${maxReadBytes} bytes.`,
+          { path, content: "" },
+        );
       }
 
       const allLines = content.split("\n");
       if (allLines.length > maxReadLines) {
-        return {
-          ok: false as const,
-          error: `File exceeds max readable line count of ${maxReadLines}.`,
-          path,
-          content: "",
-        };
+        return failureResult(
+          `File exceeds max readable line count of ${maxReadLines}.`,
+          { path, content: "" },
+        );
       }
 
       const sliceStart = Math.max(1, startLine ?? 1);
@@ -269,7 +289,7 @@ export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
     execute: async ({ path }) => {
       logger.debug('Running bash-agent fs tool "EntityStat"', { path });
 
-      const absolutePath = resolveToolPath(
+      const absolutePath = resolveCommandCwd(
         opts.workspaceRoot,
         defaultCwd,
         path,
@@ -319,7 +339,7 @@ export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
         overwrite,
       });
 
-      const absolutePath = resolveToolPath(
+      const absolutePath = resolveCommandCwd(
         opts.workspaceRoot,
         defaultCwd,
         path,
@@ -331,12 +351,10 @@ export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
       const existing = await tryCatch(() => fsClient.stat(relativePath));
 
       if (!existing.error && kind === "file" && !overwrite) {
-        return {
-          ok: false as const,
-          error: `File "${path}" already exists. Set overwrite=true to replace it.`,
-          path,
-          created: false,
-        };
+        return failureResult(
+          `File "${path}" already exists. Set overwrite=true to replace it.`,
+          { path, created: false },
+        );
       }
 
       if (kind === "directory") {
@@ -365,37 +383,24 @@ export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
   });
 
   const EditFile = tool({
-    description:
-      "Edit a file by replacing an exact string with a new string, with optional occurrence checks.",
+    description: "Edit a file by replacing an exact string with a new string.",
     inputSchema: z.object({
       path: z.string().min(1),
       oldString: z.string(),
       newString: z.string(),
       replaceAll: z.boolean().default(false),
-      expectedOccurrences: z.number().int().min(0).optional(),
     }),
-    execute: async ({
-      path,
-      oldString,
-      newString,
-      replaceAll,
-      expectedOccurrences,
-    }) => {
+    execute: async ({ path, oldString, newString, replaceAll }) => {
       logger.debug('Running bash-agent fs tool "EditFile"', {
         path,
         replaceAll,
-        expectedOccurrences,
       });
 
       if (!oldString) {
-        return {
-          ok: false as const,
-          error: "oldString must not be empty.",
-          path,
-        };
+        return failureResult("oldString must not be empty.", { path });
       }
 
-      const absolutePath = resolveToolPath(
+      const absolutePath = resolveCommandCwd(
         opts.workspaceRoot,
         defaultCwd,
         path,
@@ -415,24 +420,10 @@ export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
       const replacements = replaceAll ? matches : Math.min(matches, 1);
 
       if (replacements === 0) {
-        return {
-          ok: false as const,
-          error: `oldString not found in "${path}".`,
+        return failureResult(`oldString not found in "${path}".`, {
           path,
           replaced: false,
-        };
-      }
-
-      if (
-        typeof expectedOccurrences === "number" &&
-        expectedOccurrences !== replacements
-      ) {
-        return {
-          ok: false as const,
-          error: `Expected ${expectedOccurrences} replacements but found ${replacements}.`,
-          path,
-          replaced: false,
-        };
+        });
       }
 
       const nextContent = replaceAll
@@ -466,7 +457,7 @@ export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
         recursive,
       });
 
-      const absolutePath = resolveToolPath(
+      const absolutePath = resolveCommandCwd(
         opts.workspaceRoot,
         defaultCwd,
         path,
@@ -481,12 +472,10 @@ export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
       }
 
       if (statResult.result.isDirectory && !recursive) {
-        return {
-          ok: false as const,
-          error: `Directory "${path}" requires recursive=true to remove.`,
-          path,
-          removed: false,
-        };
+        return failureResult(
+          `Directory "${path}" requires recursive=true to remove.`,
+          { path, removed: false },
+        );
       }
 
       const { error } = await tryCatch(() => fsClient.remove(relativePath));
@@ -515,46 +504,32 @@ export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
         maxResults,
       });
 
-      const absoluteCwd = resolveToolPath(
-        opts.workspaceRoot,
-        defaultCwd,
-        cwd ?? ".",
-      );
-      const cwdRelative = toWorkspaceRelativePath(
-        opts.workspaceRoot,
-        absoluteCwd,
-      );
-      const results: string[] = [];
-      const glob = new Bun.Glob(pattern);
-
       try {
-        for await (const match of glob.scan({
-          cwd: absoluteCwd,
-          absolute: false,
-          onlyFiles: !includeDirectories,
-        })) {
-          const absoluteMatch = resolveToolPath(
-            opts.workspaceRoot,
-            cwdRelative,
-            match,
-          );
-          results.push(
-            toWorkspaceRelativePath(opts.workspaceRoot, absoluteMatch),
-          );
-          if (results.length >= maxResults) {
-            break;
-          }
-        }
+        const absoluteCwd = resolveCommandCwd(
+          opts.workspaceRoot,
+          defaultCwd,
+          cwd ?? ".",
+        );
+        const cwdRelative = toWorkspaceRelativePath(
+          opts.workspaceRoot,
+          absoluteCwd,
+        );
+        const matches = await globber.glob({
+          pattern,
+          cwd: cwdRelative,
+          includeDirectories,
+          maxResults,
+        });
+
+        return successResult({
+          pattern,
+          matches,
+        });
       } catch (error) {
         const nextError =
           error instanceof Error ? error : new Error(String(error));
         return failureResult(nextError, { pattern, matches: [] });
       }
-
-      return successResult({
-        pattern,
-        matches: [...new Set(results)],
-      });
     },
   });
 

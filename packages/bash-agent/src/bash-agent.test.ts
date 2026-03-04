@@ -14,28 +14,95 @@ import { findModel, getDefaultModelSelection } from "@protean/model-catalog";
 import { createLocalFs } from "@protean/vfs";
 
 let generateCalls: Array<{ messages: unknown[] }> = [];
+let createAgentCalls: Array<{ instructions?: string }> = [];
+const sandboxClientState = {
+  execCalls: [] as Array<{ command: string; cwd?: string; timeoutMs?: number }>,
+  readCalls: [] as string[],
+  workspaceMountPath: "/workspace",
+};
 
 await mock.module("./base-agent", () => ({
-  createAgent: () => ({
-    agent: { id: "mock-bash-agent" },
-    generate: async (args: { messages: unknown[] }) => {
-      generateCalls.push(args);
+  createAgent: (args: { instructions?: string }) => {
+    createAgentCalls.push(args);
+
+    return {
+      agent: { id: "mock-bash-agent" },
+      generate: async (args: { messages: unknown[] }) => {
+        generateCalls.push(args);
+        return {
+          text: "assistant reply",
+          usage: {
+            inputTokens: 12,
+            outputTokens: 4,
+          },
+        };
+      },
+      stream: async () => {
+        throw new Error("stream not implemented in tests");
+      },
+      asTool: () => ({
+        description: "mock",
+        inputSchema: undefined,
+        execute: async () => ({ text: "assistant reply" }),
+      }),
+    };
+  },
+}));
+
+await mock.module("@protean/sandbox-client", () => ({
+  createSandboxClient: async () => ({
+    sessionId: "sandbox-session-1",
+    workspaceMountPath: sandboxClientState.workspaceMountPath,
+    workspaceFullPath: "/tmp/sandbox-session-1",
+    fs: {
+      stat: async () => ({
+        size: 0,
+        isDirectory: false,
+        modified: new Date(0).toISOString(),
+        created: new Date(0).toISOString(),
+      }),
+      readdir: async () => [],
+      readFile: async (filePath: string) => {
+        sandboxClientState.readCalls.push(filePath);
+        return "remote";
+      },
+      readFileBuffer: async () => Buffer.from("remote"),
+      mkdir: async () => undefined,
+      writeFile: async () => undefined,
+      writeFileBuffer: async () => undefined,
+      move: async () => undefined,
+      remove: async () => undefined,
+      resolvePath: (filePath: string) => filePath,
+    },
+    getSession: async () => ({
+      sessionId: "sandbox-session-1",
+      workspaceMountPath: sandboxClientState.workspaceMountPath,
+      workspaceFullPath: "/tmp/sandbox-session-1",
+      containerName: "protean-sandbox-sandbox-session-1",
+      containerId: "container-1",
+      image: "protean-sandbox:1",
+      state: "running",
+      createdAt: new Date(0).toISOString(),
+      exists: true,
+      workspaceReady: true,
+      containerPresent: true,
+      containerRunning: true,
+    }),
+    exec: async (input: {
+      command: string;
+      cwd?: string;
+      timeoutMs?: number;
+    }) => {
+      sandboxClientState.execCalls.push(input);
       return {
-        text: "assistant reply",
-        usage: {
-          inputTokens: 12,
-          outputTokens: 4,
-        },
+        exitCode: 0,
+        stdout: "remote",
+        stderr: "",
+        timedOut: false,
+        signalCode: null,
       };
     },
-    stream: async () => {
-      throw new Error("stream not implemented in tests");
-    },
-    asTool: () => ({
-      description: "mock",
-      inputSchema: undefined,
-      execute: async () => ({ text: "assistant reply" }),
-    }),
+    deleteSession: async () => undefined,
   }),
 }));
 
@@ -75,6 +142,10 @@ describe("createBashAgent", () => {
 
   beforeEach(async () => {
     generateCalls = [];
+    createAgentCalls = [];
+    sandboxClientState.execCalls = [];
+    sandboxClientState.readCalls = [];
+    sandboxClientState.workspaceMountPath = "/workspace";
     const fixture = await createMemoryFixture();
     workspaceRoot = fixture.workspaceRoot;
     memory = fixture.memory;
@@ -105,7 +176,10 @@ describe("createBashAgent", () => {
       {
         threadId: thread.id,
         memory,
-        workspaceRoot,
+        environment: {
+          kind: "local",
+          workspaceRoot,
+        },
         modelOverride: {} as LanguageModel,
       },
       noopLogger,
@@ -156,7 +230,10 @@ describe("createBashAgent", () => {
       {
         threadId: thread.id,
         memory,
-        workspaceRoot,
+        environment: {
+          kind: "local",
+          workspaceRoot,
+        },
         modelOverride: {} as LanguageModel,
       },
       noopLogger,
@@ -198,7 +275,10 @@ describe("createBashAgent", () => {
       {
         threadId: thread.id,
         memory,
-        workspaceRoot,
+        environment: {
+          kind: "local",
+          workspaceRoot,
+        },
         modelOverride: {} as LanguageModel,
       },
       noopLogger,
@@ -225,7 +305,10 @@ describe("createBashAgent", () => {
       {
         threadId: thread.id,
         memory,
-        workspaceRoot,
+        environment: {
+          kind: "local",
+          workspaceRoot,
+        },
         modelOverride: {} as LanguageModel,
       },
       noopLogger,
@@ -248,12 +331,121 @@ describe("createBashAgent", () => {
       {
         threadId: thread.id,
         memory,
-        workspaceRoot,
+        environment: {
+          kind: "local",
+          workspaceRoot,
+        },
         modelOverride: {} as LanguageModel,
       },
       noopLogger,
     );
 
     expect(result).toBeDefined();
+  });
+
+  test("builds sandbox-backed tools when sandbox mode is requested", async () => {
+    const agent = await createBashAgent(
+      {
+        threadId: thread.id,
+        memory,
+        environment: {
+          kind: "sandbox",
+          serviceBaseUrl: "http://sandbox.example",
+          serviceToken: "token",
+          sessionId: "sandbox-session-1",
+        },
+        modelOverride: {} as LanguageModel,
+      },
+      noopLogger,
+    );
+
+    const bashTool = agent.tools.Bash;
+    if (!bashTool?.execute) {
+      throw new Error("Bash tool was not configured.");
+    }
+
+    const readTool = agent.tools.ReadFile;
+    if (!readTool?.execute) {
+      throw new Error("ReadFile tool was not configured.");
+    }
+
+    await bashTool.execute(
+      {
+        command: "pwd",
+      } as never,
+      {} as never,
+    );
+    await readTool.execute(
+      {
+        path: "notes.txt",
+        withLineNumbers: false,
+      } as never,
+      {} as never,
+    );
+
+    // First exec call is the `rg` availability check at init time, second is the actual `pwd` command.
+    const commandCalls = sandboxClientState.execCalls.filter(
+      (c) => c.command !== "command -v rg >/dev/null 2>&1",
+    );
+    expect(commandCalls).toHaveLength(1);
+    expect(commandCalls[0]?.command).toBe("pwd");
+    expect(sandboxClientState.readCalls).toEqual(["notes.txt"]);
+  });
+
+  test("uses remote exec for sandbox globbing", async () => {
+    const agent = await createBashAgent(
+      {
+        threadId: thread.id,
+        memory,
+        environment: {
+          kind: "sandbox",
+          serviceBaseUrl: "http://sandbox.example",
+          serviceToken: "token",
+          sessionId: "sandbox-session-1",
+        },
+        modelOverride: {} as LanguageModel,
+      },
+      noopLogger,
+    );
+
+    const globTool = agent.tools.Glob;
+    if (!globTool?.execute) {
+      throw new Error("Glob tool was not configured.");
+    }
+
+    const result = await globTool.execute(
+      {
+        pattern: "*.txt",
+        maxResults: 10,
+      } as never,
+      {} as never,
+    );
+
+    expect((result as { ok: boolean }).ok).toBe(true);
+    expect((result as { matches: string[] }).matches).toEqual(["remote"]);
+    expect(sandboxClientState.execCalls.at(-1)?.command).toContain(
+      "python3 -c",
+    );
+  });
+
+  test("uses the sandbox service workspace mount path by default", async () => {
+    sandboxClientState.workspaceMountPath = "/sandbox-root";
+
+    await createBashAgent(
+      {
+        threadId: thread.id,
+        memory,
+        environment: {
+          kind: "sandbox",
+          serviceBaseUrl: "http://sandbox.example",
+          serviceToken: "token",
+          sessionId: "sandbox-session-1",
+        },
+        modelOverride: {} as LanguageModel,
+      },
+      noopLogger,
+    );
+
+    expect(createAgentCalls.at(-1)?.instructions).toContain("/sandbox-root");
   });
 });
