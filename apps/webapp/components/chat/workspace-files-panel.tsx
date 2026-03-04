@@ -139,8 +139,19 @@ export function WorkspaceFilesPanel() {
   useEffect(() => {
     if (storageType === "cloud") {
       void refreshEntries(currentDir);
+    } else if (storageType === "local") {
+      // const fs = new FileSystem();
+      // // console.log(showDirectoryPicker)
+      // console.log(fs.name, fs.root.getDirectory());
     }
   }, [currentDir, refreshEntries, storageType]);
+
+  async function reqPerm() {
+    // const res = await window.navigator.permissions.query({
+    //   name: "storage-access",
+    // });
+    // console.log(res);
+  }
 
   function handleOpen(entry: FileEntry) {
     openEntry(entry);
@@ -276,6 +287,7 @@ export function WorkspaceFilesPanel() {
                 Let the browser agent work on your computer!
                 <br />
               </p>
+              <Button onClick={reqPerm}>Give access</Button>
             </div>
           )}
         </SidebarContent>
