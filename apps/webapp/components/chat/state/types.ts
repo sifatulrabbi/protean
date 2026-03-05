@@ -3,7 +3,6 @@ import type { UseChatHelpers } from "@ai-sdk/react";
 import type { ModelSelection } from "@protean/model-catalog";
 import type { ThreadUsage, ThreadRecordTrimmed } from "@protean/agent-memory";
 import type { ThreadStatus } from "@/components/chat/thread-ui-shared";
-import type { FileEntry } from "@/components/chat/file-entry-context-menu";
 
 export interface ThreadActionResult {
   error?: Error;
@@ -61,12 +60,42 @@ export interface ThreadsSidebarState {
 
 export type StorageType = "cloud" | "local";
 
+export interface WorkspaceProject {
+  name: string;
+  relativePath: string;
+  workspaceMountPath: string;
+}
+
+export interface WorkspaceProjectTreeNode {
+  children?: WorkspaceProjectTreeNode[];
+  isDirectory: boolean;
+  modified?: string;
+  name: string;
+  projectPath: string;
+  size?: number;
+  workspacePath: string;
+}
+
+export interface WorkspaceSkill {
+  id: string;
+  name: string;
+  description: string;
+  path: string;
+  frontmatter: Record<string, unknown>;
+  metadata?: Record<string, string>;
+}
+
 export interface WorkspaceFilesState {
-  currentDir: string;
-  entries: FileEntry[];
-  error: string | null;
-  loading: boolean;
-  renameEntry: FileEntry | null;
+  projectTree: WorkspaceProjectTreeNode[];
+  projectTreeError: string | null;
+  projectTreeLoading: boolean;
+  projects: WorkspaceProject[];
+  projectsError: string | null;
+  projectsLoading: boolean;
+  selectedFileWorkspacePath: string | null;
+  selectedProjectName: string;
+  skills: WorkspaceSkill[];
+  skillsError: string | null;
+  skillsLoading: boolean;
   storageType: StorageType;
-  viewerFile: FileEntry | null;
 }

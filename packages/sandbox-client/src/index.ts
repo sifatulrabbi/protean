@@ -2,6 +2,11 @@ import { normalize } from "node:path";
 import type { Logger } from "@protean/logger";
 import type { FS } from "@protean/vfs";
 
+export const DEFAULT_SANDBOX_PROJECT_NAME = "Default";
+
+const SANDBOX_PROJECTS_DIR = "projects";
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+
 export interface SandboxSession {
   sessionId: string;
   workspaceMountPath: string;
@@ -42,6 +47,10 @@ export interface SandboxServiceClientConfig {
   logger?: Logger;
 }
 
+export interface CreateSandboxSessionInput {
+  sessionId?: string;
+}
+
 export interface SandboxClientConfig extends SandboxServiceClientConfig {
   sessionId: string;
 }
@@ -58,6 +67,17 @@ export interface SandboxClient {
     timeoutMs?: number;
   }): Promise<SandboxExecResult>;
   deleteSession(): Promise<void>;
+}
+
+export interface SandboxProject {
+  name: string;
+  relativePath: string;
+  workspaceMountPath: string;
+}
+
+export interface WorkspaceProjectContext {
+  fs: FS;
+  workspaceMountPath: string;
 }
 
 interface VfsEnvelope<T> {
@@ -119,6 +139,46 @@ function buildSandboxError(
 
 function normalizePath(filePath: string): string {
   return normalize(filePath).replace(/^\/+/, "").replace(/\\/g, "/");
+}
+
+function validateProjectName(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    throw new Error("Project name must not be empty.");
+  }
+  if (trimmed === "." || trimmed === "..") {
+    throw new Error(`Invalid project name: "${name}".`);
+  }
+  if (
+    trimmed.includes("/") ||
+    trimmed.includes("\\") ||
+    CONTROL_CHARACTERS.test(trimmed)
+  ) {
+    throw new Error(`Invalid project name: "${name}".`);
+  }
+
+  return trimmed;
+}
+
+function toProjectRelativePath(name: string): string {
+  return `${SANDBOX_PROJECTS_DIR}/${validateProjectName(name)}`;
+}
+
+function toProjectMountPath(workspaceMountPath: string, name: string): string {
+  return resolveWorkspacePath(workspaceMountPath, toProjectRelativePath(name));
+}
+
+async function ensureDirectory(fs: FS, dirPath: string): Promise<void> {
+  try {
+    await fs.mkdir(dirPath);
+    return;
+  } catch {
+    const stat = await fs.stat(dirPath);
+    if (stat.isDirectory) {
+      return;
+    }
+    throw new Error(`Path "${dirPath}" already exists and is not a directory.`);
+  }
 }
 
 function resolveWorkspacePath(workspaceRoot: string, filePath: string): string {
@@ -306,12 +366,60 @@ function createSandboxFs(
 
 export async function createSandboxSession(
   config: SandboxServiceClientConfig,
+  input?: CreateSandboxSessionInput,
 ): Promise<SandboxSession> {
   const requester = createRequester(config);
+  const hasSessionId = typeof input?.sessionId === "string";
   return requester.fetchJson<SandboxSession>(
     `${requester.baseUrl}/api/v1/sandbox/sessions`,
-    { method: "POST" },
+    {
+      method: "POST",
+      ...(hasSessionId
+        ? {
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ sessionId: input?.sessionId }),
+          }
+        : {}),
+    },
   );
+}
+
+function isSessionNotFoundError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const maybeErr = error as NodeJS.ErrnoException & {
+    status?: number;
+    vfsCode?: string;
+  };
+  return (
+    maybeErr.status === 404 ||
+    maybeErr.code === "ENOENT" ||
+    maybeErr.vfsCode === "NOT_FOUND"
+  );
+}
+
+export async function ensureSandboxSession(
+  config: SandboxServiceClientConfig,
+  input: { sessionId: string },
+): Promise<SandboxClient> {
+  try {
+    return await createSandboxClient({
+      ...config,
+      sessionId: input.sessionId,
+    });
+  } catch (error) {
+    if (!isSessionNotFoundError(error)) {
+      throw error;
+    }
+  }
+
+  await createSandboxSession(config, { sessionId: input.sessionId });
+  return createSandboxClient({
+    ...config,
+    sessionId: input.sessionId,
+  });
 }
 
 export async function createSandboxClient(
@@ -347,4 +455,88 @@ export async function createSandboxClient(
       });
     },
   };
+}
+
+export async function ensureSandboxProject(
+  client: SandboxClient,
+  input?: { name?: string },
+): Promise<SandboxProject> {
+  return ensureWorkspaceProject(
+    {
+      fs: client.fs,
+      workspaceMountPath: client.workspaceMountPath,
+    },
+    input,
+  );
+}
+
+export async function ensureWorkspaceProject(
+  context: WorkspaceProjectContext,
+  input?: { name?: string },
+): Promise<SandboxProject> {
+  const name = validateProjectName(input?.name ?? DEFAULT_SANDBOX_PROJECT_NAME);
+  await ensureDirectory(context.fs, SANDBOX_PROJECTS_DIR);
+
+  const relativePath = toProjectRelativePath(name);
+  await ensureDirectory(context.fs, relativePath);
+
+  return {
+    name,
+    relativePath,
+    workspaceMountPath: toProjectMountPath(context.workspaceMountPath, name),
+  };
+}
+
+export async function listSandboxProjects(
+  client: SandboxClient,
+): Promise<SandboxProject[]> {
+  return listWorkspaceProjects({
+    fs: client.fs,
+    workspaceMountPath: client.workspaceMountPath,
+  });
+}
+
+export async function listWorkspaceProjects(
+  context: WorkspaceProjectContext,
+): Promise<SandboxProject[]> {
+  try {
+    const projectsStat = await context.fs.stat(SANDBOX_PROJECTS_DIR);
+    if (!projectsStat.isDirectory) {
+      throw new Error(
+        `Path "${SANDBOX_PROJECTS_DIR}" already exists and is not a directory.`,
+      );
+    }
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      (error as NodeJS.ErrnoException).code === "ENOENT"
+    ) {
+      return [];
+    }
+    throw error;
+  }
+
+  const entries = await context.fs.readdir(SANDBOX_PROJECTS_DIR);
+  return entries
+    .filter((entry) => entry.isDirectory)
+    .flatMap((entry) => {
+      try {
+        const name = validateProjectName(entry.name);
+        return [
+          {
+            name,
+            relativePath: toProjectRelativePath(name),
+            workspaceMountPath: toProjectMountPath(
+              context.workspaceMountPath,
+              name,
+            ),
+          },
+        ];
+      } catch {
+        return [];
+      }
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
 }

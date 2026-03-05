@@ -17,6 +17,7 @@ import {
 } from "@/components/chat/services/thread-api-client";
 import { useComposerStore } from "@/components/chat/state/composer-store";
 import { useThreadSessionStore } from "@/components/chat/state/thread-session-store";
+import { useWorkspaceFilesStore } from "@/components/chat/state/workspace-files-store";
 import type { ThreadActionResult } from "@/components/chat/state/types";
 
 interface EditUserMessageArgs {
@@ -108,6 +109,7 @@ export function useThreadActions() {
           const threadId = await createThread({
             initialUserMessage: trimmedText,
             modelSelection: composerStore.modelSelection,
+            projectName: useWorkspaceFilesStore.getState().selectedProjectName,
             title: trimmedText.slice(0, 60),
           });
 

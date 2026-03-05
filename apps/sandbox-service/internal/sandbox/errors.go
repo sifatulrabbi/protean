@@ -3,7 +3,7 @@ package sandbox
 import "errors"
 
 var (
-	// ErrInvalidSessionID is returned when the caller supplies a malformed ULID.
+	// ErrInvalidSessionID is returned when the caller supplies a malformed session ID.
 	ErrInvalidSessionID = errors.New("invalid sandbox session id")
 	// ErrSessionNotFound is returned when no metadata exists for the requested session.
 	ErrSessionNotFound = errors.New("sandbox session not found")

@@ -22,7 +22,7 @@ export async function PATCH(
   }
 
   const { threadId, messageId } = await params;
-  const memory = await getAgentMemory();
+  const memory = await getAgentMemory(userId);
   let thread = await memory.getThreadWithMessages(threadId);
 
   if (!thread || !canAccessThread(thread, userId)) {

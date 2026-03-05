@@ -394,6 +394,83 @@ func TestSessionLifecycleEndpoints(t *testing.T) {
 	}
 }
 
+func TestCreateSessionWithExplicitSessionID(t *testing.T) {
+	svc := sandbox.NewService(sandbox.ServiceConfig{
+		WorkspaceBase:      t.TempDir(),
+		ContainerPrefix:    "protean-sandbox",
+		WorkspaceMountPath: "/workspace",
+		DefaultImage:       "protean-sandbox:1",
+		Logger:             testLogger(),
+		ExecDefaultTimeout: 30 * time.Second,
+		ExecMaxTimeout:     5 * time.Minute,
+		ExecMaxOutputBytes: 65536,
+	}, &fakeRuntime{})
+
+	handler := New(Config{
+		ServiceTokens: map[string]string{"token": "test"},
+		Service:       svc,
+		Logger:        testLogger(),
+	})
+
+	createReq := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/sandbox/sessions",
+		bytes.NewBufferString(`{"sessionId":"alice@example.com"}`),
+	)
+	createReq.Header.Set("Authorization", "Bearer token")
+	createReq.Header.Set("Content-Type", "application/json")
+	createRec := httptest.NewRecorder()
+	handler.ServeHTTP(createRec, createReq)
+
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", createRec.Code)
+	}
+
+	var createEnvelope struct {
+		OK   bool                   `json:"ok"`
+		Data sandbox.SandboxSession `json:"data"`
+	}
+	if err := json.Unmarshal(createRec.Body.Bytes(), &createEnvelope); err != nil {
+		t.Fatalf("decode create response: %v", err)
+	}
+	if createEnvelope.Data.SessionID != "alice@example.com" {
+		t.Fatalf("expected explicit session id, got %q", createEnvelope.Data.SessionID)
+	}
+}
+
+func TestCreateSessionRejectsInvalidExplicitSessionID(t *testing.T) {
+	svc := sandbox.NewService(sandbox.ServiceConfig{
+		WorkspaceBase:      t.TempDir(),
+		ContainerPrefix:    "protean-sandbox",
+		WorkspaceMountPath: "/workspace",
+		DefaultImage:       "protean-sandbox:1",
+		Logger:             testLogger(),
+		ExecDefaultTimeout: 30 * time.Second,
+		ExecMaxTimeout:     5 * time.Minute,
+		ExecMaxOutputBytes: 65536,
+	}, &fakeRuntime{})
+
+	handler := New(Config{
+		ServiceTokens: map[string]string{"token": "test"},
+		Service:       svc,
+		Logger:        testLogger(),
+	})
+
+	createReq := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/sandbox/sessions",
+		bytes.NewBufferString(`{"sessionId":"../bad"}`),
+	)
+	createReq.Header.Set("Authorization", "Bearer token")
+	createReq.Header.Set("Content-Type", "application/json")
+	createRec := httptest.NewRecorder()
+	handler.ServeHTTP(createRec, createReq)
+
+	if createRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", createRec.Code)
+	}
+}
+
 func TestReservedMetadataPathIsBlocked(t *testing.T) {
 	root := t.TempDir()
 	svc := sandbox.NewService(sandbox.ServiceConfig{

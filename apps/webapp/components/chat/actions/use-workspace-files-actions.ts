@@ -1,94 +1,162 @@
 "use client";
 
 import { useCallback } from "react";
-import type { FileEntry } from "@/components/chat/file-entry-context-menu";
+import { updateThreadSettings } from "@/components/chat/services/thread-api-client";
 import {
-  deleteEntry,
-  downloadUrl,
-  listEntries,
-  renameEntry,
+  createWorkspaceProject,
+  deleteWorkspaceFile,
+  listWorkspaceProjectFiles,
+  listWorkspaceProjects,
+  listWorkspaceSkills,
+  renameWorkspaceFile,
 } from "@/components/chat/services/workspace-files-api-client";
+import { useThreadSessionStore } from "@/components/chat/state/thread-session-store";
 import { useWorkspaceFilesStore } from "@/components/chat/state/workspace-files-store";
 
-function triggerDownload(url: string, fileName: string): void {
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = fileName;
-  document.body.appendChild(anchor);
-  anchor.click();
-  document.body.removeChild(anchor);
+async function persistThreadProject(projectName: string): Promise<void> {
+  const threadId = useThreadSessionStore.getState().activeThreadId;
+  if (!threadId) {
+    return;
+  }
+
+  await updateThreadSettings({
+    threadId,
+    projectName,
+  });
 }
 
 export function useWorkspaceFilesActions() {
-  const refreshEntries = useCallback(async (dir?: string): Promise<void> => {
+  const refreshProjects = useCallback(async (): Promise<void> => {
     const store = useWorkspaceFilesStore.getState();
-    const targetDir = dir ?? store.currentDir;
 
-    store.setLoading(true);
-    store.setError(null);
+    store.setProjectsLoading(true);
+    store.setProjectsError(null);
 
     try {
-      const entries = await listEntries(targetDir);
-      store.setEntries(entries);
+      const projects = await listWorkspaceProjects();
+      store.setProjects(projects);
     } catch {
-      store.setEntries([]);
-      store.setError("Failed to load directory");
+      store.setProjects([]);
+      store.setProjectsError("Failed to load projects");
     } finally {
-      store.setLoading(false);
+      store.setProjectsLoading(false);
     }
   }, []);
 
-  const openEntry = useCallback((entry: FileEntry): void => {
-    if (entry.isDirectory) {
-      useWorkspaceFilesStore.getState().setCurrentDir(entry.path);
-      return;
-    }
+  const refreshSkills = useCallback(async (): Promise<void> => {
+    const store = useWorkspaceFilesStore.getState();
 
-    useWorkspaceFilesStore.getState().openViewer(entry);
+    store.setSkillsLoading(true);
+    store.setSkillsError(null);
+
+    try {
+      const skills = await listWorkspaceSkills();
+      store.setSkills(skills);
+    } catch {
+      store.setSkills([]);
+      store.setSkillsError("Failed to load skills");
+    } finally {
+      store.setSkillsLoading(false);
+    }
   }, []);
 
-  const deleteEntryFromWorkspace = useCallback(
-    async (entry: FileEntry): Promise<void> => {
-      const ok = await deleteEntry(entry.path);
-      if (!ok) {
-        useWorkspaceFilesStore.getState().setError("Failed to delete entry");
-        return;
-      }
-
-      await refreshEntries();
-    },
-    [refreshEntries],
-  );
-
-  const confirmRename = useCallback(
-    async (newName: string): Promise<void> => {
+  const refreshProjectTree = useCallback(
+    async (projectName?: string): Promise<void> => {
       const store = useWorkspaceFilesStore.getState();
-      const target = store.renameEntry;
-      if (!target) {
+      const targetProjectName = (projectName ?? store.selectedProjectName).trim();
+
+      if (!targetProjectName) {
+        store.setProjectTree([]);
         return;
       }
 
-      const ok = await renameEntry(target.path, newName);
-      store.closeRename();
-      if (!ok) {
-        store.setError("Failed to rename entry");
-        return;
-      }
+      store.setProjectTreeLoading(true);
+      store.setProjectTreeError(null);
 
-      await refreshEntries();
+      try {
+        const { entries } = await listWorkspaceProjectFiles(targetProjectName);
+        store.setProjectTree(entries);
+      } catch {
+        store.setProjectTree([]);
+        store.setProjectTreeError("Failed to load project files");
+      } finally {
+        store.setProjectTreeLoading(false);
+      }
     },
-    [refreshEntries],
+    [],
   );
 
-  const downloadEntry = useCallback((entry: FileEntry): void => {
-    triggerDownload(downloadUrl(entry.path), entry.name);
-  }, []);
+  const selectProject = useCallback(
+    async (projectName: string): Promise<void> => {
+      const store = useWorkspaceFilesStore.getState();
+      store.setSelectedProjectName(projectName);
+      await refreshProjectTree(projectName);
+
+      try {
+        await persistThreadProject(projectName);
+      } catch {
+        store.setProjectsError("Failed to update active thread project");
+      }
+    },
+    [refreshProjectTree],
+  );
+
+  const createProject = useCallback(
+    async (name: string): Promise<boolean> => {
+      const store = useWorkspaceFilesStore.getState();
+      store.setProjectsError(null);
+
+      try {
+        const project = await createWorkspaceProject(name);
+        if (!project) {
+          store.setProjectsError("Failed to create project");
+          return false;
+        }
+
+        await refreshProjects();
+        await selectProject(project.name);
+        return true;
+      } catch {
+        store.setProjectsError("Failed to create project");
+        return false;
+      }
+    },
+    [refreshProjects, selectProject],
+  );
+
+  const deleteFile = useCallback(
+    async (workspacePath: string): Promise<boolean> => {
+      try {
+        await deleteWorkspaceFile(workspacePath);
+        await refreshProjectTree();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [refreshProjectTree],
+  );
+
+  const renameFile = useCallback(
+    async (workspacePath: string, newName: string): Promise<boolean> => {
+      try {
+        await renameWorkspaceFile(workspacePath, newName);
+        await refreshProjectTree();
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [refreshProjectTree],
+  );
 
   return {
-    confirmRename,
-    deleteEntry: deleteEntryFromWorkspace,
-    downloadEntry,
-    openEntry,
-    refreshEntries,
+    createProject,
+    deleteFile,
+    refreshProjectTree,
+    refreshProjects,
+    refreshSkills,
+    renameFile,
+    selectProject,
   };
 }

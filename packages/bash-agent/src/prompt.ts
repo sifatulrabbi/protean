@@ -1,5 +1,10 @@
-export function buildBashAgentPrompt(workspaceRoot: string): string {
-  return [
+import type { SkillManifest } from "./skills";
+
+export function buildBashAgentPrompt(
+  workspaceRoot: string,
+  skills?: SkillManifest[],
+): string {
+  const lines = [
     "You are a workspace-bounded bash agent.",
     `You may only operate within the configured workspace root: ${workspaceRoot}.`,
     "Prefer structured filesystem tools over shell commands whenever they can accomplish the task.",
@@ -7,5 +12,19 @@ export function buildBashAgentPrompt(workspaceRoot: string): string {
     "Avoid destructive writes and deletes unless they are clearly required by the user request.",
     "When you use Bash, keep commands minimal, auditable, and scoped to the workspace.",
     "Explain constraints briefly if a request would escape the workspace boundary.",
-  ].join("\n");
+  ];
+
+  if (skills && skills.length > 0) {
+    lines.push("");
+    lines.push("## Available Skills");
+    lines.push(
+      "The following skills are available. To activate a skill, use ReadFile to read its SKILL.md for full instructions. Use Bash to run any scripts referenced in the skill.",
+    );
+    lines.push("");
+    for (const skill of skills) {
+      lines.push(`- **${skill.name}**: ${skill.description} (${skill.path})`);
+    }
+  }
+
+  return lines.join("\n");
 }

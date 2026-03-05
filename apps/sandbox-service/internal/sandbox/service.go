@@ -1,13 +1,16 @@
 package sandbox
 
 import (
+	"crypto/sha1"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -18,7 +21,7 @@ const MetadataFilename = ".sandbox-session.json"
 
 // SessionMetadata is the persisted metadata stored inside each workspace.
 type SessionMetadata struct {
-	// SessionID is the ULID assigned to the sandbox session.
+	// SessionID is the stable identifier assigned to the sandbox session.
 	SessionID string `json:"sessionId"`
 	// CreatedAt stores the creation timestamp in RFC3339Nano format.
 	CreatedAt string `json:"createdAt"`
@@ -34,7 +37,7 @@ type SessionMetadata struct {
 
 // SandboxSession is returned when a session is created successfully.
 type SandboxSession struct {
-	// SessionID is the ULID assigned to the sandbox session.
+	// SessionID is the stable identifier assigned to the sandbox session.
 	SessionID string `json:"sessionId"`
 	// WorkspaceMountPath is the in-container mount path clients should treat as the workspace root.
 	WorkspaceMountPath string `json:"workspaceMountPath"`
@@ -54,7 +57,7 @@ type SandboxSession struct {
 
 // SandboxSessionStatus reports the current state of an existing session.
 type SandboxSessionStatus struct {
-	// SessionID is the ULID assigned to the sandbox session.
+	// SessionID is the stable identifier assigned to the sandbox session.
 	SessionID string `json:"sessionId"`
 	// WorkspaceMountPath is the in-container mount path clients should use.
 	WorkspaceMountPath string `json:"workspaceMountPath"`
@@ -120,6 +123,62 @@ type Service struct {
 	logger *slog.Logger
 }
 
+const (
+	maxSessionIDLength       = 128
+	maxContainerSessionSlice = 24
+)
+
+func validateSessionID(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", ErrInvalidSessionID
+	}
+	if trimmed == "." || trimmed == ".." {
+		return "", ErrInvalidSessionID
+	}
+	if len(trimmed) > maxSessionIDLength {
+		return "", ErrInvalidSessionID
+	}
+
+	for _, r := range trimmed {
+		if r == '/' || r == '\\' || r < 0x20 || r == 0x7f {
+			return "", ErrInvalidSessionID
+		}
+	}
+
+	return trimmed, nil
+}
+
+func sanitizeSessionIDForContainerName(sessionID string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(sessionID) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('-')
+	}
+
+	sanitized := strings.Trim(b.String(), "-")
+	if sanitized == "" {
+		sanitized = "session"
+	}
+	if len(sanitized) > maxContainerSessionSlice {
+		sanitized = sanitized[:maxContainerSessionSlice]
+	}
+	return sanitized
+}
+
+func containerNameForSession(
+	containerPrefix string,
+	sessionID string,
+) string {
+	sum := sha1.Sum([]byte(sessionID))
+	hash := hex.EncodeToString(sum[:])[:10]
+	sessionPart := sanitizeSessionIDForContainerName(sessionID)
+	return fmt.Sprintf("%s-%s-%s", containerPrefix, sessionPart, hash)
+}
+
 // NewService constructs a Service using the caller-provided logger.
 func NewService(cfg ServiceConfig, r Runtime) *Service {
 	if cfg.Logger == nil {
@@ -134,8 +193,31 @@ func NewService(cfg ServiceConfig, r Runtime) *Service {
 }
 
 // CreateSession allocates a workspace, writes metadata, and ensures its container exists.
-func (s *Service) CreateSession(ctx context.Context) (SandboxSession, error) {
+func (s *Service) CreateSession(
+	ctx context.Context,
+	requestedSessionID *string,
+) (SandboxSession, error) {
 	sessionID := ulid.Make().String()
+	if requestedSessionID != nil {
+		validated, err := validateSessionID(*requestedSessionID)
+		if err != nil {
+			return SandboxSession{}, err
+		}
+		sessionID = validated
+
+		metadata, loadErr := s.LoadMetadata(sessionID)
+		if loadErr == nil {
+			container, ensureErr := s.runtime.EnsureContainer(ctx, metadata)
+			if ensureErr != nil {
+				return SandboxSession{}, ensureErr
+			}
+			return s.toSandboxSession(metadata, container), nil
+		}
+		if !errors.Is(loadErr, ErrSessionNotFound) {
+			return SandboxSession{}, loadErr
+		}
+	}
+
 	workspacePath := filepath.Join(s.config.WorkspaceBase, sessionID)
 	if err := os.MkdirAll(workspacePath, 0o755); err != nil {
 		s.logger.Error("sandbox session create failed", "step", "mkdir", "error", err)
@@ -148,7 +230,7 @@ func (s *Service) CreateSession(ctx context.Context) (SandboxSession, error) {
 		CreatedAt:          time.Now().UTC().Format(time.RFC3339Nano),
 		WorkspaceFullPath:  workspacePath,
 		WorkspaceMountPath: s.config.WorkspaceMountPath,
-		ContainerName:      fmt.Sprintf("%s-%s", s.config.ContainerPrefix, sessionID),
+		ContainerName:      containerNameForSession(s.config.ContainerPrefix, sessionID),
 		Image:              s.config.DefaultImage,
 	}
 
@@ -274,11 +356,12 @@ func (s *Service) Exec(
 
 // LoadMetadata reads and validates the metadata file for a session.
 func (s *Service) LoadMetadata(sessionID string) (SessionMetadata, error) {
-	if _, err := ulid.ParseStrict(sessionID); err != nil {
+	validSessionID, err := validateSessionID(sessionID)
+	if err != nil {
 		return SessionMetadata{}, ErrInvalidSessionID
 	}
 
-	workspacePath := filepath.Join(s.config.WorkspaceBase, sessionID)
+	workspacePath := filepath.Join(s.config.WorkspaceBase, validSessionID)
 	metadataPath := filepath.Join(workspacePath, MetadataFilename)
 	data, err := os.ReadFile(metadataPath)
 	if err != nil {
@@ -295,26 +378,29 @@ func (s *Service) LoadMetadata(sessionID string) (SessionMetadata, error) {
 	}
 
 	// Each field is validated against current config so stale or tampered metadata is rejected.
-	if metadata.SessionID != sessionID {
-		s.logger.Warn("sandbox metadata invalid", "sessionId", sessionID, "field", "sessionId")
+	if metadata.SessionID != validSessionID {
+		s.logger.Warn("sandbox metadata invalid", "sessionId", validSessionID, "field", "sessionId")
 		return SessionMetadata{}, ErrInvalidSessionMetadata
 	}
-	expectedWorkspacePath := filepath.Join(s.config.WorkspaceBase, sessionID)
+	expectedWorkspacePath := filepath.Join(s.config.WorkspaceBase, validSessionID)
 	if filepath.Clean(metadata.WorkspaceFullPath) != filepath.Clean(expectedWorkspacePath) {
-		s.logger.Warn("sandbox metadata invalid", "sessionId", sessionID, "field", "workspaceFullPath")
+		s.logger.Warn("sandbox metadata invalid", "sessionId", validSessionID, "field", "workspaceFullPath")
 		return SessionMetadata{}, ErrInvalidSessionMetadata
 	}
 	if metadata.WorkspaceMountPath != s.config.WorkspaceMountPath {
-		s.logger.Warn("sandbox metadata invalid", "sessionId", sessionID, "field", "workspaceMountPath")
+		s.logger.Warn("sandbox metadata invalid", "sessionId", validSessionID, "field", "workspaceMountPath")
 		return SessionMetadata{}, ErrInvalidSessionMetadata
 	}
-	expectedContainerName := fmt.Sprintf("%s-%s", s.config.ContainerPrefix, sessionID)
+	expectedContainerName := containerNameForSession(
+		s.config.ContainerPrefix,
+		validSessionID,
+	)
 	if metadata.ContainerName != expectedContainerName {
-		s.logger.Warn("sandbox metadata invalid", "sessionId", sessionID, "field", "containerName")
+		s.logger.Warn("sandbox metadata invalid", "sessionId", validSessionID, "field", "containerName")
 		return SessionMetadata{}, ErrInvalidSessionMetadata
 	}
 	if metadata.Image != s.config.DefaultImage {
-		s.logger.Warn("sandbox metadata invalid", "sessionId", sessionID, "field", "image")
+		s.logger.Warn("sandbox metadata invalid", "sessionId", validSessionID, "field", "image")
 		return SessionMetadata{}, ErrInvalidSessionMetadata
 	}
 

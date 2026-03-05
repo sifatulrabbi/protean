@@ -13,6 +13,7 @@ interface ThreadRuntimeControllerProps {
   initialMessageUsageMap?: Record<string, ThreadUsage>;
   initialMessages?: UIMessage[];
   initialModelSelection?: ModelSelection;
+  initialProjectName?: string;
   initialThreadId?: string;
   providers: AIModelProviderEntry[];
 }
@@ -22,6 +23,7 @@ export function ThreadRuntimeController({
   initialMessageUsageMap,
   initialMessages = [],
   initialModelSelection,
+  initialProjectName,
   initialThreadId,
   providers,
 }: ThreadRuntimeControllerProps) {
@@ -30,6 +32,7 @@ export function ThreadRuntimeController({
     initialMessageUsageMap,
     initialMessages,
     initialModelSelection,
+    initialProjectName,
     initialThreadId,
     providers,
   });

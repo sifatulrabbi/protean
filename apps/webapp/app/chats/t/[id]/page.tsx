@@ -27,7 +27,7 @@ export default async function ThreadPage({
     redirect("/login");
   }
 
-  const memory = await getAgentMemory();
+  const memory = await getAgentMemory(session.user.email);
   let thread: ThreadRecord | null = null;
   try {
     thread = await memory.getThreadWithMessages(id);
@@ -48,6 +48,7 @@ export default async function ThreadPage({
       initialMessageUsageMap={threadToMessageUsageMap(thread)}
       initialMessages={threadToUiMessages(thread)}
       initialModelSelection={initialModelSelection}
+      initialProjectName={thread.projectName}
       initialThreadId={thread.id}
       providers={providers}
     />

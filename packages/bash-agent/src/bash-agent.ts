@@ -13,7 +13,11 @@ import {
 } from "@protean/agent-memory";
 import { consoleLogger, type Logger } from "@protean/logger";
 import { findModel } from "@protean/model-catalog";
-import { createSandboxClient } from "@protean/sandbox-client";
+import {
+  DEFAULT_SANDBOX_PROJECT_NAME,
+  createSandboxClient,
+  ensureSandboxProject,
+} from "@protean/sandbox-client";
 
 import { createAgent } from "./base-agent";
 import {
@@ -25,6 +29,7 @@ import {
 import { createFsTools, type Globber } from "./fs-tools";
 import { createModelFromSelection } from "./model-provider";
 import { buildBashAgentPrompt } from "./prompt";
+import { discoverSkills } from "./skills";
 import {
   resolveWithinWorkspace,
   toWorkspaceRelativePath,
@@ -41,6 +46,7 @@ export interface SandboxBashEnvironment {
   serviceBaseUrl: string;
   serviceToken: string;
   sessionId: string;
+  projectName?: string;
   workspaceRoot?: string;
 }
 
@@ -48,6 +54,7 @@ export interface BashAgentOptions {
   threadId: string;
   memory: AgentMemory;
   environment: LocalBashEnvironment | SandboxBashEnvironment;
+  additionalTools?: Record<string, Tool>;
   cwd?: string;
   instructions?: string;
   maxSteps?: number;
@@ -230,6 +237,7 @@ export async function createBashAgent(
   let fsTools: Record<string, Tool>;
   let bashTools: Record<string, Tool>;
   let workspaceRoot: string;
+  let fsClient: import("@protean/vfs").FS | undefined;
 
   if (opts.environment.kind === "sandbox") {
     const sandboxClient = await createSandboxClient({
@@ -240,6 +248,19 @@ export async function createBashAgent(
     });
     workspaceRoot =
       opts.environment.workspaceRoot ?? sandboxClient.workspaceMountPath;
+    fsClient = sandboxClient.fs;
+
+    let projectCwd = opts.cwd;
+    if (!opts.environment.workspaceRoot) {
+      const projectName =
+        opts.environment.projectName ??
+        thread.projectName ??
+        DEFAULT_SANDBOX_PROJECT_NAME;
+      const project = await ensureSandboxProject(sandboxClient, {
+        name: projectName,
+      });
+      projectCwd = projectCwd ?? project.relativePath;
+    }
 
     shellRunner = {
       exec: async ({ command, cwd, timeoutMs }: ShellRunnerInput) =>
@@ -260,8 +281,8 @@ export async function createBashAgent(
     fsTools = await createFsTools(
       {
         workspaceRoot,
-        fs: sandboxClient.fs,
-        cwd: opts.cwd,
+        fs: fsClient,
+        cwd: projectCwd,
         maxReadBytes: opts.maxOutputBytes,
         globber,
       },
@@ -270,7 +291,7 @@ export async function createBashAgent(
     bashTools = await createBashTools(
       {
         workspaceRoot,
-        cwd: opts.cwd,
+        cwd: projectCwd,
         timeoutMs: opts.bashTimeoutMs,
         maxOutputBytes: opts.maxOutputBytes,
         runner: shellRunner,
@@ -299,16 +320,33 @@ export async function createBashAgent(
     );
   }
 
-  const tools = {
+  const baseTools = {
     ...fsTools,
     ...bashTools,
   };
+  const additionalTools = opts.additionalTools ?? {};
+
+  for (const [toolName] of Object.entries(additionalTools)) {
+    if (toolName in baseTools) {
+      throw new Error(
+        `Tool name collision: "${toolName}" already exists in bash-agent tools.`,
+      );
+    }
+  }
+
+  const tools = {
+    ...baseTools,
+    ...additionalTools,
+  };
+
+  const skills = fsClient ? await discoverSkills(fsClient) : [];
 
   const agentWrapper = createAgent({
     name: "bash-agent",
     model,
     tools,
-    instructions: opts.instructions ?? buildBashAgentPrompt(workspaceRoot),
+    instructions:
+      opts.instructions ?? buildBashAgentPrompt(workspaceRoot, skills),
     maxSteps: opts.maxSteps,
   });
 

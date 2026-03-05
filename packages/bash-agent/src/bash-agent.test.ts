@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { LanguageModel, UIMessage } from "ai";
+import type { LanguageModel, Tool, UIMessage } from "ai";
 import {
   createFsMemory,
   deriveActiveHistory,
@@ -14,15 +14,24 @@ import { findModel, getDefaultModelSelection } from "@protean/model-catalog";
 import { createLocalFs } from "@protean/vfs";
 
 let generateCalls: Array<{ messages: unknown[] }> = [];
-let createAgentCalls: Array<{ instructions?: string }> = [];
+let createAgentCalls: Array<{
+  instructions?: string;
+  tools?: Record<string, Tool>;
+}> = [];
 const sandboxClientState = {
   execCalls: [] as Array<{ command: string; cwd?: string; timeoutMs?: number }>,
+  ensuredProjects: [] as string[],
   readCalls: [] as string[],
   workspaceMountPath: "/workspace",
+  skillDirs: [] as Array<{ name: string; isDirectory: boolean }>,
+  skillFiles: {} as Record<string, string>,
 };
 
 await mock.module("./base-agent", () => ({
-  createAgent: (args: { instructions?: string }) => {
+  createAgent: (args: {
+    instructions?: string;
+    tools?: Record<string, Tool>;
+  }) => {
     createAgentCalls.push(args);
 
     return {
@@ -50,6 +59,7 @@ await mock.module("./base-agent", () => ({
 }));
 
 await mock.module("@protean/sandbox-client", () => ({
+  DEFAULT_SANDBOX_PROJECT_NAME: "Default",
   createSandboxClient: async () => ({
     sessionId: "sandbox-session-1",
     workspaceMountPath: sandboxClientState.workspaceMountPath,
@@ -61,9 +71,17 @@ await mock.module("@protean/sandbox-client", () => ({
         modified: new Date(0).toISOString(),
         created: new Date(0).toISOString(),
       }),
-      readdir: async () => [],
+      readdir: async (dirPath: string) => {
+        if (dirPath === "skills" && sandboxClientState.skillDirs.length > 0) {
+          return sandboxClientState.skillDirs;
+        }
+        return [];
+      },
       readFile: async (filePath: string) => {
         sandboxClientState.readCalls.push(filePath);
+        if (filePath in sandboxClientState.skillFiles) {
+          return sandboxClientState.skillFiles[filePath];
+        }
         return "remote";
       },
       readFileBuffer: async () => Buffer.from("remote"),
@@ -104,6 +122,18 @@ await mock.module("@protean/sandbox-client", () => ({
     },
     deleteSession: async () => undefined,
   }),
+  ensureSandboxProject: async (
+    client: { workspaceMountPath: string },
+    input?: { name?: string },
+  ) => {
+    const name = input?.name?.trim() || "Default";
+    sandboxClientState.ensuredProjects.push(name);
+    return {
+      name,
+      relativePath: `projects/${name}`,
+      workspaceMountPath: `${client.workspaceMountPath}/projects/${name}`,
+    };
+  },
 }));
 
 const { createBashAgent } = await import("./bash-agent");
@@ -144,8 +174,11 @@ describe("createBashAgent", () => {
     generateCalls = [];
     createAgentCalls = [];
     sandboxClientState.execCalls = [];
+    sandboxClientState.ensuredProjects = [];
     sandboxClientState.readCalls = [];
     sandboxClientState.workspaceMountPath = "/workspace";
+    sandboxClientState.skillDirs = [];
+    sandboxClientState.skillFiles = {};
     const fixture = await createMemoryFixture();
     workspaceRoot = fixture.workspaceRoot;
     memory = fixture.memory;
@@ -389,7 +422,7 @@ describe("createBashAgent", () => {
     );
     expect(commandCalls).toHaveLength(1);
     expect(commandCalls[0]?.command).toBe("pwd");
-    expect(sandboxClientState.readCalls).toEqual(["notes.txt"]);
+    expect(sandboxClientState.ensuredProjects).toEqual(["Default"]);
   });
 
   test("uses remote exec for sandbox globbing", async () => {
@@ -422,7 +455,9 @@ describe("createBashAgent", () => {
     );
 
     expect((result as { ok: boolean }).ok).toBe(true);
-    expect((result as { matches: string[] }).matches).toEqual(["remote"]);
+    expect((result as { matches: string[] }).matches).toEqual([
+      "projects/Default/remote",
+    ]);
     expect(sandboxClientState.execCalls.at(-1)?.command).toContain(
       "python3 -c",
     );
@@ -447,5 +482,157 @@ describe("createBashAgent", () => {
     );
 
     expect(createAgentCalls.at(-1)?.instructions).toContain("/sandbox-root");
+  });
+
+  test("uses the thread project name by default in sandbox mode", async () => {
+    const projectThread = await memory.createThread({
+      userId: "user-1",
+      title: "Project Thread",
+      projectName: "My Project",
+      modelSelection: getDefaultModelSelection(),
+    });
+
+    await createBashAgent(
+      {
+        threadId: projectThread.id,
+        memory,
+        environment: {
+          kind: "sandbox",
+          serviceBaseUrl: "http://sandbox.example",
+          serviceToken: "token",
+          sessionId: "sandbox-session-1",
+        },
+        modelOverride: {} as LanguageModel,
+      },
+      noopLogger,
+    );
+
+    expect(sandboxClientState.ensuredProjects).toEqual(["My Project"]);
+    expect(createAgentCalls.at(-1)?.instructions).toContain("/workspace");
+  });
+
+  test("preserves explicit sandbox workspaceRoot overrides", async () => {
+    await createBashAgent(
+      {
+        threadId: thread.id,
+        memory,
+        environment: {
+          kind: "sandbox",
+          serviceBaseUrl: "http://sandbox.example",
+          serviceToken: "token",
+          sessionId: "sandbox-session-1",
+          workspaceRoot: "/workspace/custom-root",
+        },
+        modelOverride: {} as LanguageModel,
+      },
+      noopLogger,
+    );
+
+    expect(sandboxClientState.ensuredProjects).toEqual([]);
+    expect(createAgentCalls.at(-1)?.instructions).toContain(
+      "/workspace/custom-root",
+    );
+  });
+
+  test("discovers skills and includes them in sandbox agent instructions", async () => {
+    sandboxClientState.skillDirs = [
+      { name: "code-review", isDirectory: true },
+    ];
+    sandboxClientState.skillFiles = {
+      "skills/code-review/SKILL.md": `---
+name: Code Review
+description: Automated code review skill
+---
+# Code Review Skill`,
+    };
+
+    await createBashAgent(
+      {
+        threadId: thread.id,
+        memory,
+        environment: {
+          kind: "sandbox",
+          serviceBaseUrl: "http://sandbox.example",
+          serviceToken: "token",
+          sessionId: "sandbox-session-1",
+        },
+        modelOverride: {} as LanguageModel,
+      },
+      noopLogger,
+    );
+
+    const instructions = createAgentCalls.at(-1)?.instructions ?? "";
+    expect(instructions).toContain("Available Skills");
+    expect(instructions).toContain("Code Review");
+    expect(instructions).toContain("Automated code review skill");
+    expect(instructions).toContain("skills/code-review/SKILL.md");
+  });
+
+  test("local mode produces no skills in prompt", async () => {
+    await createBashAgent(
+      {
+        threadId: thread.id,
+        memory,
+        environment: {
+          kind: "local",
+          workspaceRoot,
+        },
+        modelOverride: {} as LanguageModel,
+      },
+      noopLogger,
+    );
+
+    const instructions = createAgentCalls.at(-1)?.instructions ?? "";
+    expect(instructions).not.toContain("Available Skills");
+  });
+
+  test("injects additional non-colliding tools", async () => {
+    const additionalTools: Record<string, Tool> = {
+      ExtraTool: {
+        description: "Extra test tool",
+        inputSchema: undefined,
+        execute: async () => ({ ok: true }),
+      } as unknown as Tool,
+    };
+
+    await createBashAgent(
+      {
+        threadId: thread.id,
+        memory,
+        environment: {
+          kind: "local",
+          workspaceRoot,
+        },
+        additionalTools,
+        modelOverride: {} as LanguageModel,
+      },
+      noopLogger,
+    );
+
+    expect(createAgentCalls.at(-1)?.tools?.ExtraTool).toBeDefined();
+  });
+
+  test("rejects additional tools that collide with internal tools", async () => {
+    expect(
+      createBashAgent(
+        {
+          threadId: thread.id,
+          memory,
+          environment: {
+            kind: "local",
+            workspaceRoot,
+          },
+          additionalTools: {
+            Bash: {
+              description: "conflict",
+              inputSchema: undefined,
+              execute: async () => ({ ok: false }),
+            } as unknown as Tool,
+          },
+          modelOverride: {} as LanguageModel,
+        },
+        noopLogger,
+      ),
+    ).rejects.toThrow("Tool name collision");
   });
 });

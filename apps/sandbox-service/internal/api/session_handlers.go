@@ -7,13 +7,24 @@ import (
 	"github.com/protean/sandbox-service/internal/sandbox"
 )
 
+type createSessionRequest struct {
+	SessionID *string `json:"sessionId,omitempty"`
+}
+
 // handleSessions handles collection-level session routes.
 func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	if !s.requireMethod(w, r, http.MethodPost) {
 		return
 	}
 
-	session, err := s.service.CreateSession(r.Context())
+	var payload createSessionRequest
+	if r.Body != nil && r.Body != http.NoBody {
+		if err := s.decodeJSON(w, r, &payload, maxJSONBodyBytes); err != nil {
+			return
+		}
+	}
+
+	session, err := s.service.CreateSession(r.Context(), payload.SessionID)
 	if err != nil {
 		s.writeSandboxError(w, err)
 		return

@@ -53,6 +53,7 @@ export interface ThreadRecord {
   id: string;
   userId: string;
   title: string;
+  projectName: string;
   modelSelection: ModelSelection;
   history: ThreadMessageRecord[];
   lastCompactionOrdinal: number | null;
@@ -97,6 +98,7 @@ export interface CreateThreadParams {
   id?: string;
   userId: string;
   title?: string;
+  projectName?: string;
   modelSelection: ModelSelection;
   /** Override the creation timestamp (ISO-8601). Useful in tests. */
   createdAt?: string;
@@ -104,6 +106,7 @@ export interface CreateThreadParams {
 
 export interface UpdateThreadSettingsParams {
   title?: string;
+  projectName?: string;
   modelSelection?: ModelSelection | null;
   now?: string;
 }

@@ -28,7 +28,8 @@
     "@tavily/ai-sdk": "^0.4.1",
     "ai": "^6.0.78",
     "dotenv": "^17.2.3",
-    "zod": "^4.3.6"
+    "zod": "^4.3.6",
+    "@protean/skill-manifests": "workspace:*"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

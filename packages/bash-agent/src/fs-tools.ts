@@ -389,8 +389,15 @@ export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
       oldString: z.string(),
       newString: z.string(),
       replaceAll: z.boolean().default(false),
+      expectedOccurrences: z.number().int().min(0).optional(),
     }),
-    execute: async ({ path, oldString, newString, replaceAll }) => {
+    execute: async ({
+      path,
+      oldString,
+      newString,
+      replaceAll,
+      expectedOccurrences,
+    }) => {
       logger.debug('Running bash-agent fs tool "EditFile"', {
         path,
         replaceAll,
@@ -424,6 +431,19 @@ export async function createFsTools(opts: FsToolsOptions, logger: Logger) {
           path,
           replaced: false,
         });
+      }
+
+      if (
+        typeof expectedOccurrences === "number" &&
+        expectedOccurrences !== replacements
+      ) {
+        return failureResult(
+          `Expected ${expectedOccurrences} replacements but found ${replacements}.`,
+          {
+            path,
+            replaced: false,
+          },
+        );
       }
 
       const nextContent = replaceAll

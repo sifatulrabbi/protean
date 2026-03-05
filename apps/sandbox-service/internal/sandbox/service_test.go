@@ -102,7 +102,7 @@ func TestCreateSessionWritesMetadata(t *testing.T) {
 		ExecMaxOutputBytes: 65536,
 	}, runtime)
 
-	session, err := service.CreateSession(context.Background())
+	session, err := service.CreateSession(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestGetSessionStatusWithoutContainerStillUsesMetadata(t *testing.T) {
 		ExecMaxOutputBytes: 65536,
 	}, runtime)
 
-	session, err := service.CreateSession(context.Background())
+	session, err := service.CreateSession(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
@@ -166,7 +166,7 @@ func TestExecEnsuresContainerAndNormalizesCwd(t *testing.T) {
 		ExecMaxOutputBytes: 65536,
 	}, runtime)
 
-	session, err := service.CreateSession(context.Background())
+	session, err := service.CreateSession(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
@@ -202,7 +202,7 @@ func TestLoadMetadataRejectsTamperedWorkspacePath(t *testing.T) {
 		ExecMaxOutputBytes: 65536,
 	}, runtime)
 
-	session, err := service.CreateSession(context.Background())
+	session, err := service.CreateSession(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestLoadMetadataRejectsTamperedWorkspacePath(t *testing.T) {
   "createdAt": "2026-03-01T00:00:00Z",
   "workspaceFullPath": "/tmp/elsewhere",
   "workspaceMountPath": "/workspace",
-  "containerName": "protean-sandbox-` + session.SessionID + `",
+  "containerName": "` + containerNameForSession("protean-sandbox", session.SessionID) + `",
   "image": "protean-sandbox:1"
 }`)
 	if err := os.WriteFile(metadataPath, badMetadata, 0644); err != nil {
@@ -238,7 +238,7 @@ func TestLoadMetadataRejectsMalformedJSON(t *testing.T) {
 		ExecMaxOutputBytes: 65536,
 	}, &fakeRuntime{})
 
-	session, err := service.CreateSession(context.Background())
+	session, err := service.CreateSession(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("CreateSession failed: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestCreateSessionRollsBackWorkspaceOnEnsureFailure(t *testing.T) {
 		ExecMaxOutputBytes: 65536,
 	}, &fakeRuntime{ensureErr: errors.New("boom")})
 
-	_, err := service.CreateSession(context.Background())
+	_, err := service.CreateSession(context.Background(), nil)
 	if err == nil {
 		t.Fatal("expected CreateSession to fail")
 	}
@@ -299,6 +299,96 @@ func TestCreateSessionRollsBackWorkspaceOnEnsureFailure(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "sandbox session create failed") {
 		t.Fatalf("expected create failure log, got %q", logs.String())
+	}
+}
+
+func TestCreateSessionUsesRequestedSessionID(t *testing.T) {
+	root := t.TempDir()
+	runtime := &fakeRuntime{}
+	service := NewService(ServiceConfig{
+		WorkspaceBase:      root,
+		ContainerPrefix:    "protean-sandbox",
+		WorkspaceMountPath: "/workspace",
+		DefaultImage:       "protean-sandbox:1",
+		Logger:             testLogger(),
+		ExecDefaultTimeout: 30 * time.Second,
+		ExecMaxTimeout:     5 * time.Minute,
+		ExecMaxOutputBytes: 65536,
+	}, runtime)
+
+	sessionID := "alice@example.com"
+	session, err := service.CreateSession(context.Background(), &sessionID)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	if session.SessionID != sessionID {
+		t.Fatalf("expected session id %q, got %q", sessionID, session.SessionID)
+	}
+	if session.ContainerName != containerNameForSession("protean-sandbox", sessionID) {
+		t.Fatalf("unexpected container name: %s", session.ContainerName)
+	}
+	if runtime.ensureCalls != 1 {
+		t.Fatalf("expected one ensure call, got %d", runtime.ensureCalls)
+	}
+}
+
+func TestCreateSessionReusesExistingRequestedSession(t *testing.T) {
+	root := t.TempDir()
+	runtime := &fakeRuntime{}
+	service := NewService(ServiceConfig{
+		WorkspaceBase:      root,
+		ContainerPrefix:    "protean-sandbox",
+		WorkspaceMountPath: "/workspace",
+		DefaultImage:       "protean-sandbox:1",
+		Logger:             testLogger(),
+		ExecDefaultTimeout: 30 * time.Second,
+		ExecMaxTimeout:     5 * time.Minute,
+		ExecMaxOutputBytes: 65536,
+	}, runtime)
+
+	sessionID := "alice@example.com"
+	first, err := service.CreateSession(context.Background(), &sessionID)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+	second, err := service.CreateSession(context.Background(), &sessionID)
+	if err != nil {
+		t.Fatalf("CreateSession failed: %v", err)
+	}
+
+	if first.SessionID != second.SessionID {
+		t.Fatalf("expected same session id, got %q and %q", first.SessionID, second.SessionID)
+	}
+	if runtime.ensureCalls != 2 {
+		t.Fatalf("expected two ensure calls for create+reuse, got %d", runtime.ensureCalls)
+	}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read root: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one workspace directory, got %d", len(entries))
+	}
+}
+
+func TestCreateSessionRejectsInvalidRequestedSessionID(t *testing.T) {
+	service := NewService(ServiceConfig{
+		WorkspaceBase:      t.TempDir(),
+		ContainerPrefix:    "protean-sandbox",
+		WorkspaceMountPath: "/workspace",
+		DefaultImage:       "protean-sandbox:1",
+		Logger:             testLogger(),
+		ExecDefaultTimeout: 30 * time.Second,
+		ExecMaxTimeout:     5 * time.Minute,
+		ExecMaxOutputBytes: 65536,
+	}, &fakeRuntime{})
+
+	sessionID := "../bad"
+	_, err := service.CreateSession(context.Background(), &sessionID)
+	if !errors.Is(err, ErrInvalidSessionID) {
+		t.Fatalf("expected ErrInvalidSessionID, got %v", err)
 	}
 }
 

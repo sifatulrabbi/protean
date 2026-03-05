@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireUserId } from "@/lib/server/auth-user";
-import { createRemoteFs } from "@protean/vfs";
+import { createWorkspaceFs } from "@/lib/server/workspace-fs";
 
 export async function GET(request: NextRequest) {
   const userId = await requireUserId();
@@ -10,13 +10,8 @@ export async function GET(request: NextRequest) {
 
   const dir = request.nextUrl.searchParams.get("dir") ?? "/";
 
-  const fs = await createRemoteFs({
-    baseUrl: process.env.VFS_SERVER_URL!,
-    serviceToken: process.env.VFS_SERVICE_TOKEN!,
-    userId,
-  });
-
   try {
+    const fs = await createWorkspaceFs(userId);
     const dirEntries = await fs.readdir(dir);
 
     const entries = await Promise.all(

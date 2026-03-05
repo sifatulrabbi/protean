@@ -20,3 +20,5 @@ export type {
 
 export { createFsTools } from "./fs-tools";
 export type { FsToolsOptions, Globber } from "./fs-tools";
+
+export { createWebTools } from "./web-tools";

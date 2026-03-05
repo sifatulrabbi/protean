@@ -76,6 +76,7 @@ describe("createFsMemory", () => {
     expect(thread.deletedAt).toBeNull();
     expect(thread.userId).toBe("user-1");
     expect(thread.title).toBe("My Thread");
+    expect(thread.projectName).toBe("Default");
     expect(thread.modelSelection?.providerId).toBe("openrouter");
   });
 
@@ -103,6 +104,7 @@ describe("createFsMemory", () => {
     });
     const updated = await repo.updateThreadSettings(thread.id, {
       title: "Renamed",
+      projectName: "My Project",
       modelSelection: {
         providerId: "openrouter",
         modelId: "gpt-5",
@@ -112,7 +114,34 @@ describe("createFsMemory", () => {
     });
 
     expect(updated?.title).toBe("Renamed");
+    expect(updated?.projectName).toBe("My Project");
     expect(updated?.modelSelection?.modelId).toBe("gpt-5");
+  });
+
+  test("accepts projectName during thread creation", async () => {
+    const repo = await createRepository();
+    const thread = await repo.createThread({
+      userId: "user-1",
+      projectName: "Another Project",
+      modelSelection: defaultModelSelection,
+    });
+
+    expect(thread.projectName).toBe("Another Project");
+  });
+
+  test("rejects invalid project names", async () => {
+    const repo = await createRepository();
+
+    await expect(
+      repo.createThread({
+        userId: "user-1",
+        projectName: "bad/name",
+        modelSelection: defaultModelSelection,
+      }),
+    ).rejects.toMatchObject({
+      code: "INVALID_STATE",
+      name: "ThreadMemoryError",
+    });
   });
 
   test("replaceMessages updates existing message payloads in-place", async () => {
@@ -456,13 +485,66 @@ describe("createFsMemory", () => {
       schemaVersion: number;
       contentSchemaVersion: number;
       id: string;
+      projectName: string;
       history: unknown[];
     };
 
-    expect(parsed.schemaVersion).toBe(1);
+    expect(parsed.schemaVersion).toBe(2);
     expect(parsed.contentSchemaVersion).toBe(1);
     expect(parsed.id).toBe(thread.id);
+    expect(parsed.projectName).toBe("Default");
     expect(parsed.history.length).toBe(0);
     expect((parsed as Record<string, unknown>).activeHistory).toBeUndefined();
+  });
+
+  test("hydrates legacy threads with the default project and rewrites as v2", async () => {
+    const repo = await createRepository();
+    const threadId = randomUUID();
+    const threadFilePath = `${threadsDir}/thread.${threadId}.json`;
+
+    await fs.writeFile(
+      threadFilePath,
+      JSON.stringify(
+        {
+          schemaVersion: 1,
+          contentSchemaVersion: 1,
+          id: threadId,
+          userId: "user-1",
+          title: "Legacy Thread",
+          modelSelection: defaultModelSelection,
+          history: [],
+          lastCompactionOrdinal: null,
+          contextSize: 0,
+          usage: {
+            inputTokens: 0,
+            outputTokens: 0,
+            totalDurationMs: 0,
+            totalCostUsd: 0,
+          },
+          createdAt: new Date(0).toISOString(),
+          updatedAt: new Date(0).toISOString(),
+          deletedAt: null,
+        },
+        null,
+        2,
+      ),
+    );
+
+    const loaded = await repo.getThreadWithMessages(threadId);
+    expect(loaded?.schemaVersion).toBe(2);
+    expect(loaded?.projectName).toBe("Default");
+
+    const updated = await repo.updateThreadSettings(threadId, {
+      title: "Rewritten",
+    });
+    expect(updated?.schemaVersion).toBe(2);
+
+    const raw = await fs.readFile(threadFilePath);
+    const parsed = JSON.parse(raw) as {
+      schemaVersion: number;
+      projectName: string;
+    };
+    expect(parsed.schemaVersion).toBe(2);
+    expect(parsed.projectName).toBe("Default");
   });
 });

@@ -4,7 +4,10 @@ import { config } from "dotenv";
 import { createFsMemory } from "@protean/agent-memory";
 import { noopLogger } from "@protean/logger";
 import { getDefaultModelSelection } from "@protean/model-catalog";
-import { createSandboxClient } from "@protean/sandbox-client";
+import {
+  DEFAULT_SANDBOX_PROJECT_NAME,
+  createSandboxClient,
+} from "@protean/sandbox-client";
 
 import { createBashAgent } from "./bash-agent";
 
@@ -127,6 +130,8 @@ async function main(): Promise<void> {
   const serviceBaseUrl = requireEnv("SANDBOX_BASE_URL");
   const serviceToken = requireEnv("SANDBOX_SERVICE_TOKEN");
   const sessionId = requireEnv("SANDBOX_SESSION_ID");
+  const projectName =
+    process.env.SANDBOX_PROJECT_NAME?.trim() || DEFAULT_SANDBOX_PROJECT_NAME;
   const sandboxClient = await createSandboxClient({
     baseUrl: serviceBaseUrl,
     serviceToken,
@@ -134,11 +139,15 @@ async function main(): Promise<void> {
     logger: noopLogger,
   });
 
-  const memory = await createFsMemory({ fs: sandboxClient.fs }, noopLogger);
+  const memory = await createFsMemory(
+    { fs: sandboxClient.fs, dirPath: ".threads" },
+    noopLogger,
+  );
   const modelSelection = getDefaultModelSelection();
   const thread = await memory.createThread({
     userId: "bash-agent-cli",
     title: "Bash Agent Chat CLI",
+    projectName,
     modelSelection,
   });
 
@@ -151,9 +160,7 @@ async function main(): Promise<void> {
         serviceBaseUrl,
         serviceToken,
         sessionId,
-        workspaceRoot:
-          process.env.SANDBOX_WORKSPACE_ROOT?.trim() ||
-          sandboxClient.workspaceMountPath,
+        projectName,
       },
     },
     noopLogger,

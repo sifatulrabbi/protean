@@ -20,6 +20,7 @@ interface ThreadRouteContentProps {
   defaultModelSelection: ModelSelection;
   initialMessageUsageMap?: Record<string, ThreadUsage>;
   initialMessages?: UIMessage[];
+  initialProjectName?: string;
   initialThreadId?: string;
   initialModelSelection?: ModelSelection;
   providers: AIModelProviderEntry[];
@@ -29,6 +30,7 @@ export function ThreadRouteContent({
   defaultModelSelection,
   initialMessageUsageMap,
   initialMessages,
+  initialProjectName,
   initialThreadId,
   initialModelSelection,
   providers,
@@ -39,6 +41,7 @@ export function ThreadRouteContent({
         defaultModelSelection={defaultModelSelection}
         initialMessageUsageMap={initialMessageUsageMap}
         initialMessages={initialMessages}
+        initialProjectName={initialProjectName}
         initialModelSelection={initialModelSelection}
         initialThreadId={initialThreadId}
         providers={providers}
@@ -46,7 +49,7 @@ export function ThreadRouteContent({
       <SidebarProvider
         className="!min-h-0 h-full"
         defaultOpen={true}
-        style={{ "--sidebar-width": "20rem" } as React.CSSProperties}
+        style={{ "--sidebar-width": "clamp(16rem, 25vw, 22rem)" } as React.CSSProperties}
       >
         <SidebarInset>
           <div className="mx-auto flex min-h-0 w-full max-w-4xl flex-1 flex-col">
