@@ -135,3 +135,14 @@ interface IProject {
   bash: IBash;
 }
 ```
+
+### Mounting device dir to remote sandbox
+
+```ts
+interface IMount extends IFilesystem {
+  id: string;
+  workspacePath: string;
+}
+```
+
+Mounting local user files to a project is to create a link with the user's local files. We will have a lightweight sandbox like host app running in the user end so that our WebApp can use the host. But we need to also think how best can we setup the host app and if we should expose the host app from user's device or use the WebApp to resolve all the requests by letting talk privately with the host app?
