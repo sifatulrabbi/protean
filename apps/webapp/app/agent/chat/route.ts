@@ -1,11 +1,10 @@
 import { convertToModelMessages, type UIMessage } from "ai";
-import { createRootAgent } from "@protean/protean";
+import { createBashAgent, createWebTools } from "@protean/bash-agent";
 import {
   deriveActiveHistory,
   type ThreadMessageRecord,
 } from "@protean/agent-memory";
 import { consoleLogger } from "@protean/logger";
-import { createRemoteFs } from "@protean/vfs";
 import {
   findModel,
   isSameModelSelection,
@@ -15,6 +14,7 @@ import {
 
 import { requireUserId } from "@/lib/server/auth-user";
 import { getAgentMemory } from "@/lib/server/agent-memory";
+import { getWorkspaceSandbox } from "@/lib/server/workspace-fs";
 import { canAccessThread } from "@/lib/server/thread-utils";
 
 function isPendingMessage(message: UIMessage): boolean {
@@ -101,19 +101,12 @@ export async function POST(request: Request) {
     return Response.json({ error: "Invalid request body" }, { status: 400 });
   }
   const threadId = parsedBody.threadId;
-  const memory = await getAgentMemory();
+  const memory = await getAgentMemory(userId);
 
   let thread = await memory.getThreadWithMessages(threadId);
   if (!thread || !canAccessThread(thread, userId)) {
     return Response.json({ error: "Thread not found" }, { status: 404 });
   }
-
-  const fs = await createRemoteFs({
-    baseUrl: process.env.VFS_SERVER_URL!,
-    serviceToken: process.env.VFS_SERVICE_TOKEN!,
-    userId,
-    logger: consoleLogger,
-  });
 
   // For making sure the model selection and the reasoning budget are valid.
   const requestSelection = parseModelSelection(parsedBody.modelSelection);
@@ -185,15 +178,36 @@ export async function POST(request: Request) {
     }
   }
 
-  const agent = await createRootAgent(
-    {
-      fs,
-      modelSelection: {
-        providerId: fullModelEntry.providerId,
-        modelId: resolvedModelSelection.modelId,
-        reasoningBudget: resolvedModelSelection.reasoningBudget,
-        runtimeProvider: fullModelEntry.runtimeProvider,
+  const sandboxBaseUrl =
+    process.env.SANDBOX_BASE_URL?.trim() ??
+    process.env.SANDBOX_SERVICE_BASE_URL?.trim();
+  const sandboxServiceToken = process.env.SANDBOX_SERVICE_TOKEN?.trim();
+  if (!sandboxBaseUrl || !sandboxServiceToken) {
+    return Response.json(
+      {
+        error:
+          "Sandbox is not configured. Set SANDBOX_BASE_URL (or SANDBOX_SERVICE_BASE_URL) and SANDBOX_SERVICE_TOKEN.",
       },
+      { status: 500 },
+    );
+  }
+
+  const workspaceSandbox = await getWorkspaceSandbox(userId);
+
+  const agent = await createBashAgent(
+    {
+      threadId,
+      memory,
+      environment: {
+        kind: "sandbox",
+        serviceBaseUrl: sandboxBaseUrl,
+        serviceToken: sandboxServiceToken,
+        sessionId: workspaceSandbox.sessionId,
+        projectName: thread.projectName,
+      },
+      additionalTools: createWebTools({
+        enabled: Boolean(process.env.TAVILY_API_KEY?.trim()),
+      }),
     },
     consoleLogger,
   );
@@ -218,7 +232,7 @@ export async function POST(request: Request) {
   );
 
   const streamStartMs = Date.now();
-  const stream = await agent.stream({
+  const stream = await agent.agent.stream({
     messages: await convertToModelMessages(activeHistory),
     abortSignal: request.signal,
   });

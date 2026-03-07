@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { requireUserId } from "@/lib/server/auth-user";
-import { createRemoteFs } from "@protean/vfs";
+import { createWorkspaceFs } from "@/lib/server/workspace-fs";
 
 const MIME_MAP: Record<string, string> = {
   txt: "text/plain",
@@ -29,14 +29,6 @@ function getMimeType(filePath: string): string {
   return MIME_MAP[ext] ?? "application/octet-stream";
 }
 
-async function createFs(userId: string) {
-  return await createRemoteFs({
-    baseUrl: process.env.VFS_SERVER_URL!,
-    serviceToken: process.env.VFS_SERVICE_TOKEN!,
-    userId,
-  });
-}
-
 export async function GET(
   _request: NextRequest,
   { params }: { params: Promise<{ path: string[] }> },
@@ -48,9 +40,9 @@ export async function GET(
 
   const { path: pathSegments } = await params;
   const filePath = decodeURIComponent(pathSegments.join("/"));
-  const fs = await createFs(userId);
 
   try {
+    const fs = await createWorkspaceFs(userId);
     const fileStat = await fs.stat(filePath);
     if (fileStat.isDirectory) {
       return NextResponse.json(
@@ -94,9 +86,9 @@ export async function DELETE(
 
   const { path: pathSegments } = await params;
   const filePath = decodeURIComponent(pathSegments.join("/"));
-  const fs = await createFs(userId);
 
   try {
+    const fs = await createWorkspaceFs(userId);
     await fs.remove(filePath);
     return NextResponse.json({ deleted: true });
   } catch (err: unknown) {
@@ -135,30 +127,23 @@ export async function PATCH(
   }
 
   try {
-    const vfsUrl = process.env.VFS_SERVER_URL!;
-    const res = await fetch(`${vfsUrl}/api/v1/files/rename`, {
-      method: "PATCH",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.VFS_SERVICE_TOKEN!}`,
-        "X-User-Id": userId,
-      },
-      body: JSON.stringify({ path: filePath, newName }),
-    });
+    const fs = await createWorkspaceFs(userId);
+    const pathParts = filePath.split("/");
+    pathParts.pop();
+    const parentDir = pathParts.join("/");
+    const nextPath = parentDir ? `${parentDir}/${newName}` : newName;
 
-    if (!res.ok) {
-      const body = (await res.json().catch(() => null)) as {
-        error?: { message?: string };
-      } | null;
-      const msg = body?.error?.message ?? "Failed to rename";
-      if (res.status === 404) {
-        return NextResponse.json({ error: "File not found" }, { status: 404 });
-      }
-      return NextResponse.json({ error: msg }, { status: res.status });
-    }
+    await fs.move(filePath, nextPath);
 
     return NextResponse.json({ renamed: true, newName });
-  } catch {
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Failed to rename";
+    if (message.includes("NOT_FOUND") || message.includes("not found")) {
+      return NextResponse.json({ error: "File not found" }, { status: 404 });
+    }
+    if (message.includes("PATH_TRAVERSAL") || message.includes("not allowed")) {
+      return NextResponse.json({ error: "Path not allowed" }, { status: 403 });
+    }
     return NextResponse.json({ error: "Failed to rename" }, { status: 500 });
   }
 }

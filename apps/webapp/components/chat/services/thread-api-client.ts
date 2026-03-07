@@ -4,6 +4,7 @@ import type { ModelSelection } from "@protean/model-catalog";
 interface CreateThreadRequest {
   modelSelection: ModelSelection;
   initialUserMessage?: string;
+  projectName?: string;
   title?: string;
 }
 
@@ -16,10 +17,16 @@ interface CreateThreadResponse {
 export async function createThread({
   modelSelection,
   initialUserMessage,
+  projectName,
   title,
 }: CreateThreadRequest): Promise<string> {
   const response = await fetch("/threads", {
-    body: JSON.stringify({ initialUserMessage, modelSelection, title }),
+    body: JSON.stringify({
+      initialUserMessage,
+      modelSelection,
+      projectName,
+      title,
+    }),
     headers: {
       "Content-Type": "application/json",
     },
@@ -34,12 +41,16 @@ export async function createThread({
   return data.thread.id;
 }
 
-export async function updateThreadModelSelection(args: {
+export async function updateThreadSettings(args: {
   threadId: string;
-  modelSelection: ModelSelection;
+  modelSelection?: ModelSelection;
+  projectName?: string;
 }): Promise<void> {
   const response = await fetch(`/threads/${args.threadId}`, {
-    body: JSON.stringify({ modelSelection: args.modelSelection }),
+    body: JSON.stringify({
+      modelSelection: args.modelSelection,
+      projectName: args.projectName,
+    }),
     headers: {
       "Content-Type": "application/json",
     },
@@ -47,8 +58,15 @@ export async function updateThreadModelSelection(args: {
   });
 
   if (!response.ok) {
-    throw new Error("Unable to update thread model selection");
+    throw new Error("Unable to update thread settings");
   }
+}
+
+export async function updateThreadModelSelection(args: {
+  threadId: string;
+  modelSelection: ModelSelection;
+}): Promise<void> {
+  await updateThreadSettings(args);
 }
 
 export async function deleteThread(threadId: string): Promise<boolean> {

@@ -12,6 +12,7 @@ import type { ThreadUsage } from "@protean/agent-memory";
 import { useComposerStore } from "@/components/chat/state/composer-store";
 import { useMessageUiStore } from "@/components/chat/state/message-ui-store";
 import { useThreadSessionStore } from "@/components/chat/state/thread-session-store";
+import { useWorkspaceFilesStore } from "@/components/chat/state/workspace-files-store";
 import { isPendingMessage } from "@/components/chat/utils/chat-message-utils";
 
 interface UseThreadRuntimeArgs {
@@ -19,6 +20,7 @@ interface UseThreadRuntimeArgs {
   initialMessageUsageMap?: Record<string, ThreadUsage>;
   initialMessages: UIMessage[];
   initialModelSelection?: ModelSelection;
+  initialProjectName?: string;
   initialThreadId?: string;
   providers: AIModelProviderEntry[];
 }
@@ -28,6 +30,7 @@ export function useThreadRuntime({
   initialMessageUsageMap,
   initialMessages,
   initialModelSelection,
+  initialProjectName,
   initialThreadId,
   providers,
 }: UseThreadRuntimeArgs): void {
@@ -51,12 +54,16 @@ export function useThreadRuntime({
       messageUsageMap: initialMessageUsageMap,
       messages: initialMessages,
     });
+    useWorkspaceFilesStore
+      .getState()
+      .hydrateSelectedProjectName(initialProjectName);
 
     useMessageUiStore.getState().reset();
   }, [
     initialMessageUsageMap,
     initialMessages,
     initialSelection,
+    initialProjectName,
     initialThreadId,
   ]);
 

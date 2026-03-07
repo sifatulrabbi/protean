@@ -1,19 +1,26 @@
 import { createFsMemory, type AgentMemory } from "@protean/agent-memory";
 import { consoleLogger } from "@protean/logger";
-import { createRemoteFs } from "@protean/vfs";
+import { createWorkspaceFs } from "@/lib/server/workspace-fs";
 
-let memoryPromise: AgentMemory | null = null;
+const memoryByUserId = new Map<string, Promise<AgentMemory>>();
 
-export async function getAgentMemory(): Promise<AgentMemory> {
-  if (!memoryPromise) {
-    const fs = await createRemoteFs({
-      baseUrl: process.env.VFS_SERVER_URL!,
-      serviceToken: process.env.VFS_SERVICE_TOKEN!,
-      userId: "protean-memory",
-      logger: consoleLogger,
-    });
-    memoryPromise = await createFsMemory({ fs }, consoleLogger);
+export async function getAgentMemory(userId: string): Promise<AgentMemory> {
+  const pending = memoryByUserId.get(userId);
+  if (pending) {
+    return pending;
   }
 
-  return memoryPromise;
+  const nextPromise = (async () => {
+    const fs = await createWorkspaceFs(userId);
+    return createFsMemory({ fs, dirPath: ".threads" }, consoleLogger);
+  })();
+
+  memoryByUserId.set(userId, nextPromise);
+
+  try {
+    return await nextPromise;
+  } catch (error) {
+    memoryByUserId.delete(userId);
+    throw error;
+  }
 }

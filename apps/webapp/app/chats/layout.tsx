@@ -1,6 +1,7 @@
 import { auth } from "@/auth";
 import { ThreadsSidebar } from "@/components/chat/threads-sidebar";
 import { getAgentMemory } from "@/lib/server/agent-memory";
+import { getWorkspaceSandbox } from "@/lib/server/workspace-fs";
 import { redirect } from "next/navigation";
 
 export default async function ChatsLayout({
@@ -8,7 +9,7 @@ export default async function ChatsLayout({
 }: {
   children: React.ReactNode;
 }) {
-  const [session, memory] = await Promise.all([auth(), getAgentMemory()]);
+  const session = await auth();
 
   if (!session?.user) {
     redirect("/login");
@@ -20,6 +21,8 @@ export default async function ChatsLayout({
     redirect("/login");
   }
 
+  await getWorkspaceSandbox(userEmail);
+  const memory = await getAgentMemory(userEmail);
   const threads = await memory.listThreads({ userId: userEmail });
 
   return (

@@ -31,10 +31,11 @@ import {
 } from "./usage";
 
 /** Bumped when the shape of `ThreadRecord` itself changes in a breaking way. */
-const THREAD_SCHEMA_VERSION = 1;
+const THREAD_SCHEMA_VERSION = 2;
 /** Bumped when the shape of the stored `UIMessage` content changes. */
 const CONTENT_SCHEMA_VERSION = 1;
 const threadIdSchema = z.uuid();
+const DEFAULT_PROJECT_NAME = "Default";
 
 const threadUsageSchema = z.object({
   inputTokens: z.number(),
@@ -61,8 +62,7 @@ export { deriveActiveHistory } from "./derive-active-history";
 
 const contextSizeSchema = z.number();
 
-const threadRecordSchema: z.ZodType<ThreadRecord> = z.object({
-  schemaVersion: z.literal(THREAD_SCHEMA_VERSION),
+const threadRecordBaseSchema = {
   contentSchemaVersion: z.literal(CONTENT_SCHEMA_VERSION),
   id: threadIdSchema,
   userId: z.string().min(1),
@@ -75,22 +75,88 @@ const threadRecordSchema: z.ZodType<ThreadRecord> = z.object({
   createdAt: z.string(),
   updatedAt: z.string(),
   deletedAt: z.string().nullable(),
+} satisfies z.ZodRawShape;
+
+const threadRecordSchemaV1 = z.object({
+  schemaVersion: z.literal(1),
+  ...threadRecordBaseSchema,
 });
+
+const threadRecordSchema: z.ZodType<ThreadRecord> = z.object({
+  schemaVersion: z.literal(THREAD_SCHEMA_VERSION),
+  projectName: z.string().min(1),
+  ...threadRecordBaseSchema,
+});
+
+function normalizeProjectName(name: string): string {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    throw new ThreadMemoryError(
+      "INVALID_STATE",
+      "Project name must not be empty.",
+    );
+  }
+
+  if (trimmed === "." || trimmed === "..") {
+    throw new ThreadMemoryError(
+      "INVALID_STATE",
+      `Invalid project name: ${name}`,
+    );
+  }
+
+  if (
+    trimmed.includes("/") ||
+    trimmed.includes("\\") ||
+    /[\u0000-\u001f\u007f]/.test(trimmed)
+  ) {
+    throw new ThreadMemoryError(
+      "INVALID_STATE",
+      `Invalid project name: ${name}`,
+    );
+  }
+
+  return trimmed;
+}
+
+function resolveProjectName(input?: {
+  projectName?: string;
+}): string {
+  return input?.projectName !== undefined
+    ? normalizeProjectName(input.projectName)
+    : DEFAULT_PROJECT_NAME;
+}
 
 async function validateThreadRecord(
   payload: unknown,
 ): Promise<{ data: ThreadRecord } | { error: string }> {
   const parsed = threadRecordSchema.safeParse(payload);
 
-  if (!parsed.success) {
+  if (parsed.success) {
+    if (parsed.data.history.length > 0) {
+      const historyValidation = await safeValidateUIMessages({
+        messages: parsed.data.history.map((record) => record.message),
+      });
+
+      if (!historyValidation.success) {
+        return {
+          error: `Invalid history UIMessage payload: ${historyValidation.error.message}`,
+        };
+      }
+    }
+
+    return { data: parsed.data };
+  }
+
+  const legacyParsed = threadRecordSchemaV1.safeParse(payload);
+  if (!legacyParsed.success) {
     return {
       error: parsed.error.message,
     };
   }
 
-  if (parsed.data.history.length > 0) {
+  if (legacyParsed.data.history.length > 0) {
     const historyValidation = await safeValidateUIMessages({
-      messages: parsed.data.history.map((record) => record.message),
+      messages: legacyParsed.data.history.map((record) => record.message),
     });
 
     if (!historyValidation.success) {
@@ -100,7 +166,13 @@ async function validateThreadRecord(
     }
   }
 
-  return { data: parsed.data };
+  return {
+    data: {
+      ...legacyParsed.data,
+      schemaVersion: THREAD_SCHEMA_VERSION,
+      projectName: DEFAULT_PROJECT_NAME,
+    },
+  };
 }
 
 export interface FsMemoryOptions {
@@ -315,6 +387,9 @@ export async function createFsMemory(
     const now = params.createdAt ?? new Date().toISOString();
     const threadId = params.id ?? randomUUID();
     ensureThreadId(threadId);
+    const projectName = resolveProjectName({
+      projectName: params.projectName,
+    });
 
     const thread: ThreadRecord = {
       schemaVersion: THREAD_SCHEMA_VERSION,
@@ -322,6 +397,7 @@ export async function createFsMemory(
       id: threadId,
       userId: params.userId,
       title: params.title?.trim() || "New chat",
+      projectName,
       modelSelection: params.modelSelection,
       history: [],
       lastCompactionOrdinal: null,
@@ -647,8 +723,8 @@ export async function createFsMemory(
   }
 
   /**
-   * Updates mutable thread metadata (title/model selection) without changing
-   * message history.
+   * Updates mutable thread metadata (title/model selection/project) without
+   * changing message history.
    */
   async function updateThreadSettings(
     threadId: string,
@@ -668,10 +744,15 @@ export async function createFsMemory(
       const nextModelSelection = params.modelSelection
         ? params.modelSelection
         : thread.modelSelection;
+      const nextProjectName =
+        params.projectName !== undefined
+          ? resolveProjectName({ projectName: params.projectName })
+          : thread.projectName;
 
       const updatedThread: ThreadRecord = {
         ...thread,
         title: nextTitle,
+        projectName: nextProjectName,
         modelSelection: nextModelSelection,
         updatedAt: params.now ?? new Date().toISOString(),
       };
