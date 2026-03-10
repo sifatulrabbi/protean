@@ -142,6 +142,8 @@ interface IProject {
 interface IMount extends IFilesystem {
   id: string;
   workspacePath: string;
+  // ... More fields.
+  // I'm just showing an example and not claiming this is literally what we should have
 }
 ```
 
@@ -149,4 +151,146 @@ Mounting local user files to a project is to create a link with the user's local
 
 ## Sandbox concept
 
-The sandbox is just a docker container per user in the host machine of ours. Where we'll mount a directory per user in the path `/workspace`.
+The sandbox is just a docker container per user in the host machine of ours. Where we'll mount a directory per user in the path `/workspace`. Every file system operation from the Docker container (the sandbox) needs to be done on the attached volume or mounted directory. What I mean is:
+
+- Inside the Docker container if the user is using the "remote storage" option then we'll mount a directory for the user from host machine e.g. `/home/hostmachine/data/protean/users/user-id` to the `/workspace` path in the container. This will be as simple as creating the user specific directory in the host-machine then attaching that as a volume to the docker container.
+
+- However, the tough one will be mounting a user's local directory to the container as a volume. For that we may need to write some kind of FUSE or directory mounting logic. Since we are not wanting the user's to do complex things like setting up SSH we need to figure out a way to be able to use some strategy and mount the user's local directory to the remote container of ours. One path I see is this:
+  - Mount the user's selected directory as a project to the remote host-machine of ours. E.g., user's local directory `/Users/sifatul/coding/protean` host-machine dir `/home/hostmachine/data/protean/users/user-id/projects/protean`, mount them with each other `/home/hostmachine/data/protean/users/user-id/projects/protean:/Users/sifatul/coding/protean`.
+  - Since we already mount our `/home/hostmachine/data/protean/users/user-id` to the container's `/workspace` the container already has access to everything that is being mounted within the directory.
+  - If the user's chosen directory already exist in the remote host-machine then we will suffix the original directory name to be something unique. Then let the user know of the name we are using.
+
+- The sandbox is always the one that executes the bash commands of the agent so that the user's machine is always safe.
+
+- The container that sandboxes the agent will also allow HTTP and HTTPS traffic so that the agent can perform web scraping or searches or use tools that uses HTTP/WebSocket connections.
+
+## The Agent
+
+The agent needs to be highly testable in isolation with or without any database and tools. We should make use of the Vercel's AI SDK for this project of ours.
+
+The system prompt of this agent will instruct it to be a explorer and problem solver than just a "helpful assistant". The agent's primary goal is to take in user requests look up for the available skills then start working on the task and keep working till it's done.
+
+The agent also needs a way to store and preserve it's conversation history as well as auto compact the history when needed.
+
+```ts
+import { UIMessage } from "ai";
+
+interface IThreadBase {
+  id: string; // Auto generated. Uses ULID in a UUID compatible formatting.
+  userId: string;
+  title: string; // Auto generated after sending the first message in the thread.
+  createdAt: string; // Auto generated use ISO time stamp
+  updatedAt: string; // Auto generated on every update use ISO time stamp
+  deletedAt: string; // Auto generated on delete use ISO time stamp
+  // Note: the modelId depends on the inferenceProvider. The modelId and inferenceProvider changes together.
+  modelId: string; // The ID of the model. E.g., openai/gpt-5.4, gpt-5.4, claude-opus-4.6, anthropic/claude-opus-4.6
+  inferenceProvider: string; // The inference provider ID. E.g. openrouter, openai, anthropic.
+}
+
+interface IThreadUsage {
+  id: string; // Auto generated. Uses ULID in UUID compatible format.
+  threadId: string;
+  createdAt: string; // Auto generated use ISO time stamp
+  updatedAt: string; // Auto generated on every update use ISO time stamp
+  deletedAt: string; // Auto generated on delete use ISO time stamp
+  inputTokens: number;
+  outputTokens: number;
+  durationSeconds: number;
+}
+
+interface IThreadMessage {
+  id: string; // ULID in UUID formatted string.
+  threadId: string;
+  createdAt: string; // Auto generated use ISO time stamp
+  updatedAt: string; // Auto generated on every update use ISO time stamp
+  deletedAt: string; // Auto generated on delete use ISO time stamp
+  role: UIMessage["role"];
+  parts: UIMessage["parts"];
+  metadata: UIMessage["metadata"];
+  // The thread message will also store the model selection information
+  // so that if the same thread uses different models (changed by the user) we'd
+  // know which model was uses for which message.
+  modelId: string; // The ID of the model. E.g., openai/gpt-5.4, gpt-5.4, claude-opus-4.6, anthropic/claude-opus-4.6
+  inferenceProvider: string; // The inference provider ID. E.g. openrouter, openai, anthropic.
+}
+
+interface IThreadSummary extends IThreadBase {
+  usage: IThreadUsage;
+}
+
+interface IThread extends IThreadSummary {
+  messages: IThreadMessage[];
+}
+
+interface IAgentMemory {
+  getThreads: (userId: string) => Promise<IThreadSummary[]>
+  getThread: (payload: { id: string; userId: string }) => Promise<IThreadSummary>
+  getThreadWithMessages: (payload: { id: string; userId: string }) => Promise<IThread>
+  createThread: (payload: Omit<IThreadBase, "id" | "createdAt" | "updatedAt"> & { userId: string }) => Promise<IThreadSummary>
+  updateThread: (payload: Optional<IThreadBase> & { id: string; userId: string }) => Promise<IThreadSummary>
+  updateThreadUsage: (
+    payload: {
+      userId: string;
+      threadId: string;
+      newInputTokens: number; // pass values like +1000 or -1000
+      newOutputTokens: number;
+      newDurationSeconds: number;
+    },
+  ) => Promise<IThreadUsage>
+  deleteThread: (payload: { id: string; userId: string }) => Promise<void> // this only soft deletes
+  upsertMessage: (
+    payload: {
+      userId: string;
+      threadId: string;
+      messageId?: string;
+      role: UIMessage["role"];
+      parts: UIMessage["parts"];
+      metadata: UIMessage["metadata"];
+    },
+  ) => Promise<IThread>
+  deleteMessage: (
+    payload: {
+      userId: string;
+      threadId: string;
+      messageId: string;
+    }
+  ) => Promise<IThread>
+}
+
+interface IAgentFactoryOption {
+  memory: IAgentMemory
+  logger: ILogger
+}
+
+interface IAgentFactory {
+  (opts: IAgentFactoryOption) => Promise<IAgent>
+}
+
+interface IAgent {
+  /**
+   * The proper type of the async generator is defined by the AI-SDK and not by
+   * us. This function will call the agent that is an instance of ToolLoopAgent
+   * from AI-SDK and return the returning result. We may add some onError and
+   * onFinish also maybe onStepFinish hook if available. But the caller of the
+   * Agent.stream() should not be aware of this.
+   */
+  stream: () => Promise<ReturnTypeOf<typeof ToolLoopAgent["stream"]>>;
+}
+```
+
+The agent memory can either be a SQLite database stored in the same workspace directory of the user in the host-machine. E.g. `/workspace/db.sqlite3` in reality this is a file stored in the `/home/hostmachine/data/protean/users/user-id/db.sqlite3`. Or could be a file system based memory where we save the data as JSON. The JSON data would go inside the same directory each thread will then be a JSON file. E.g. `/workspace/.threads/[id].json`. But I'll weigh on SQLite than JSON.
+
+No matter what agent memory solution we choose we need to return the IAgentMemory interface from our IAgentMemoryFactory.
+
+## Frontend of the system
+
+The user facing frontend is a WebApp. For the web app we'll use Next.js with shadcn and AI-Elements. Use the frontend-skill along with vercel's ai-element skill and shadcn skill to prepare a top notch web app for our system.
+
+As for the auth we'll use WorkOS to let the user's login with their google accounts only. Following is the wireframe of the webapp of ours.
+(I'm also adding UI mockup images in ./ui-mockups for reference)
+
+For the frontend we must use ai-elements and the built in components than write things ourselves.
+
+The entire webapp is going to be a next.js app so we need to put our API logic in the API and the long running stuff + sandbox stuff in a different server APP that we'll host from our host-machine. We'll use fastify for any API work.
+
+The entire project will be in Bun and should follow monorepo architecture. We should also apply the microservices philosophy.
