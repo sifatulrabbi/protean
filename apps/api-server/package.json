@@ -1,0 +1,26 @@
+{
+  "name": "@protean/api-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch src/server.ts",
+    "build": "bun build ./src/server.ts --outdir dist --target bun",
+    "start": "bun dist/server.js",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.1.0",
+    "@protean/agent-memory": "workspace:*",
+    "@protean/bash-agent": "workspace:*",
+    "@protean/contracts": "workspace:*",
+    "@protean/sandbox-sdk": "workspace:*",
+    "fastify": "^5.6.1",
+    "zod": "^4.1.11"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.1",
+    "typescript": "^5.9.3"
+  }
+}

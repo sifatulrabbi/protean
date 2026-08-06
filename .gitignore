@@ -140,6 +140,8 @@ vite.config.ts.timestamp-*
 
 tmp/project/*
 tmp/sandboxes/*
+tmp/app-data/
+**/tmp/*-tests/
 *.ignore.*
 bin/
 .worktrees

@@ -8,12 +8,21 @@
   "scripts": {
     "start": "bun run --cwd apps/webapp start",
     "dev": "bun run --cwd apps/webapp dev",
-    "typecheck": "bun run --filter \"packages/*\" --if-present typecheck && bun run --filter \"apps/tui\" --if-present typecheck",
-    "build": "bun run --filter \"packages/*\" --if-present build && bun run --filter \"apps/tui\" --if-present build",
-    "lint": "bun run --cwd packages/bash-agent lint && bun run --cwd apps/webapp lint",
-    "test": "bun run --filter \"packages/*\" --if-present test && bun run --filter \"apps/tui\" --if-present test",
-    "test:integration": "bun run --cwd packages/bash-agent test && bun run --cwd apps/webapp typecheck",
-    "dev:vfs": "cd apps/vfs-server && make dev",
+    "dev:api": "bun run --cwd apps/api-server dev",
+    "dev:sandbox": "bun run --cwd apps/sandbox-server dev",
+    "typecheck": "bun run --filter \"packages/*\" --if-present typecheck && bun run --cwd apps/api-server typecheck && bun run --cwd apps/sandbox-server typecheck && bun run --cwd apps/webapp typecheck",
+    "build": "bun run --filter \"packages/*\" --if-present build && bun run --cwd apps/api-server build && bun run --cwd apps/sandbox-server build && bun run --cwd apps/webapp build",
+    "lint": "bun run --cwd apps/webapp lint",
+    "test": "bun run --filter \"packages/*\" --if-present test && bun run --cwd apps/api-server test && bun run --cwd apps/sandbox-server test",
+    "test:integration": "bun run --cwd apps/webapp typecheck",
     "format": "bunx prettier --write ./*"
+  },
+  "dependencies": {
+    "zod": "^4.1.11"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.1",
+    "prettier": "^3.6.2",
+    "typescript": "^5.9.3"
   }
 }
