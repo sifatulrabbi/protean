@@ -10,9 +10,11 @@ import (
 	"github.com/sifatulrabbi/protean/backend/internal/adapters/clock"
 	"github.com/sifatulrabbi/protean/backend/internal/adapters/entitlements/diskusage"
 	"github.com/sifatulrabbi/protean/backend/internal/adapters/entitlements/sqlitestore"
+	"github.com/sifatulrabbi/protean/backend/internal/adapters/sandbox/dockerbox"
 	"github.com/sifatulrabbi/protean/backend/internal/config"
 	"github.com/sifatulrabbi/protean/backend/internal/entitlements"
 	"github.com/sifatulrabbi/protean/backend/internal/httpserver"
+	"github.com/sifatulrabbi/protean/backend/internal/sandbox"
 )
 
 func main() {
@@ -67,6 +69,33 @@ func run(logger *slog.Logger) error {
 	}()
 	engine.Start(watcherCtx)
 
+	// The sandbox is the security boundary, so a boot without a healthy runtime
+	// is a failed boot: there is no unsandboxed fallback (D8).
+	registry := sandbox.NewRegistry(logger)
+	registry.Register(dockerbox.NewFactory(dockerbox.Options{
+		Image:          cfg.SandboxImage,
+		DataDir:        cfg.DataDir,
+		ExecTimeout:    cfg.SandboxExecTimeout,
+		IdleTimeout:    cfg.SandboxIdleTimeout,
+		ReapInterval:   cfg.SandboxReapInterval,
+		MaxRunning:     cfg.SandboxMaxRunning,
+		OutputCapBytes: cfg.SandboxOutputCapBytes,
+		Logger:         logger,
+		Clock:          systemClock,
+	}))
+	sandboxRuntime, err := registry.Select(ctx)
+	if err != nil {
+		return err
+	}
+	defer sandboxRuntime.Close()
+
+	reaperCtx, stopReaper := context.WithCancel(ctx)
+	defer func() {
+		stopReaper()
+		sandboxRuntime.Wait()
+	}()
+	sandboxRuntime.Start(reaperCtx)
+
 	srv := httpserver.New(httpserver.Deps{
 		Addr:   cfg.Addr(),
 		Logger: logger,
@@ -78,6 +107,8 @@ func run(logger *slog.Logger) error {
 		"data_dir", cfg.DataDir,
 		"sqlite_db", cfg.SQLiteDBPath,
 		"plan", plan.Name,
+		"sandbox_image", cfg.SandboxImage,
+		"sandbox_max_running", cfg.SandboxMaxRunning,
 	)
 	return srv.Run(ctx)
 }

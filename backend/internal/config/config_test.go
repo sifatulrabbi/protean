@@ -67,6 +67,8 @@ func TestLoadFrom(t *testing.T) {
 			"PROTEAN_ENTITLEMENTS_WATCH_INTERVAL", "PROTEAN_HOST_DISK_WATERMARK_PCT",
 			"PROTEAN_LLM_RESERVE_TOKENS",
 			"OPENROUTER_API_KEY", "OPENAI_API_KEY", "TAVILY_API_KEY",
+			"PROTEAN_SANDBOX_IMAGE", "PROTEAN_SANDBOX_EXEC_TIMEOUT", "PROTEAN_SANDBOX_IDLE_TIMEOUT",
+			"PROTEAN_SANDBOX_MAX_RUNNING", "PROTEAN_SANDBOX_OUTPUT_CAP_BYTES", "PROTEAN_SANDBOX_REAP_INTERVAL",
 		} {
 			t.Setenv(k, "")
 			os.Unsetenv(k)
@@ -100,6 +102,85 @@ func TestLoadFrom(t *testing.T) {
 		}
 		if cfg.LLMReserveTokens != DefaultLLMReserveTokens {
 			t.Errorf("LLMReserveTokens = %d, want %d", cfg.LLMReserveTokens, DefaultLLMReserveTokens)
+		}
+		if cfg.SandboxImage != DefaultSandboxImage {
+			t.Errorf("SandboxImage = %q, want %q", cfg.SandboxImage, DefaultSandboxImage)
+		}
+		if cfg.SandboxExecTimeout != DefaultSandboxExecTimeout {
+			t.Errorf("SandboxExecTimeout = %s, want %s", cfg.SandboxExecTimeout, DefaultSandboxExecTimeout)
+		}
+		if cfg.SandboxIdleTimeout != DefaultSandboxIdleTimeout {
+			t.Errorf("SandboxIdleTimeout = %s, want %s", cfg.SandboxIdleTimeout, DefaultSandboxIdleTimeout)
+		}
+		if cfg.SandboxReapInterval != DefaultSandboxReapInterval {
+			t.Errorf("SandboxReapInterval = %s, want %s", cfg.SandboxReapInterval, DefaultSandboxReapInterval)
+		}
+		if cfg.SandboxMaxRunning != DefaultSandboxMaxRunning {
+			t.Errorf("SandboxMaxRunning = %d, want %d", cfg.SandboxMaxRunning, DefaultSandboxMaxRunning)
+		}
+		if cfg.SandboxOutputCapBytes != DefaultSandboxOutputCapBytes {
+			t.Errorf("SandboxOutputCapBytes = %d, want %d", cfg.SandboxOutputCapBytes, DefaultSandboxOutputCapBytes)
+		}
+	})
+
+	t.Run("sandbox overrides", func(t *testing.T) {
+		clearEnv(t)
+		path := writeEnv(t, strings.Join([]string{
+			"PROTEAN_SANDBOX_IMAGE=protean-sandbox:v2",
+			"PROTEAN_SANDBOX_EXEC_TIMEOUT=45s",
+			"PROTEAN_SANDBOX_IDLE_TIMEOUT=2m",
+			"PROTEAN_SANDBOX_REAP_INTERVAL=10s",
+			"PROTEAN_SANDBOX_MAX_RUNNING=2",
+			"PROTEAN_SANDBOX_OUTPUT_CAP_BYTES=4096",
+			"",
+		}, "\n"))
+		cfg, err := LoadFrom(path)
+		if err != nil {
+			t.Fatalf("LoadFrom: %v", err)
+		}
+		if cfg.SandboxImage != "protean-sandbox:v2" {
+			t.Errorf("SandboxImage = %q, want protean-sandbox:v2", cfg.SandboxImage)
+		}
+		if cfg.SandboxExecTimeout != 45*time.Second {
+			t.Errorf("SandboxExecTimeout = %s, want 45s", cfg.SandboxExecTimeout)
+		}
+		if cfg.SandboxIdleTimeout != 2*time.Minute {
+			t.Errorf("SandboxIdleTimeout = %s, want 2m", cfg.SandboxIdleTimeout)
+		}
+		if cfg.SandboxReapInterval != 10*time.Second {
+			t.Errorf("SandboxReapInterval = %s, want 10s", cfg.SandboxReapInterval)
+		}
+		if cfg.SandboxMaxRunning != 2 {
+			t.Errorf("SandboxMaxRunning = %d, want 2", cfg.SandboxMaxRunning)
+		}
+		if cfg.SandboxOutputCapBytes != 4096 {
+			t.Errorf("SandboxOutputCapBytes = %d, want 4096", cfg.SandboxOutputCapBytes)
+		}
+	})
+
+	t.Run("invalid sandbox values", func(t *testing.T) {
+		for _, tc := range []struct{ key, value string }{
+			{"PROTEAN_SANDBOX_EXEC_TIMEOUT", "soon"},
+			{"PROTEAN_SANDBOX_EXEC_TIMEOUT", "0s"},
+			{"PROTEAN_SANDBOX_EXEC_TIMEOUT", "-5s"},
+			// Above the hard ceiling is a configuration error, not a clamp.
+			{"PROTEAN_SANDBOX_EXEC_TIMEOUT", "11m"},
+			{"PROTEAN_SANDBOX_IDLE_TIMEOUT", "never"},
+			{"PROTEAN_SANDBOX_IDLE_TIMEOUT", "-1m"},
+			{"PROTEAN_SANDBOX_REAP_INTERVAL", "-1s"},
+			{"PROTEAN_SANDBOX_MAX_RUNNING", "many"},
+			{"PROTEAN_SANDBOX_MAX_RUNNING", "0"},
+			{"PROTEAN_SANDBOX_MAX_RUNNING", "65"},
+			{"PROTEAN_SANDBOX_OUTPUT_CAP_BYTES", "lots"},
+			{"PROTEAN_SANDBOX_OUTPUT_CAP_BYTES", "512"},
+		} {
+			t.Run(tc.key+"="+tc.value, func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv(tc.key, tc.value)
+				if _, err := LoadFrom(""); err == nil {
+					t.Fatalf("want error for %s=%s", tc.key, tc.value)
+				}
+			})
 		}
 	})
 
