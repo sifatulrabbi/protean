@@ -41,6 +41,7 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/sifatulrabbi/protean/backend/internal/ports"
 	"github.com/sifatulrabbi/protean/backend/internal/sandbox"
+	"github.com/sifatulrabbi/protean/backend/internal/storage/layout"
 )
 
 const (
@@ -65,12 +66,6 @@ const (
 
 	// MaxFileBytes bounds ReadFile so a large file cannot exhaust host memory.
 	MaxFileBytes = 16 << 20
-
-	// orgsDirName mirrors the host storage layout. S4 owns this layout for
-	// real; until then the constant is duplicated deliberately rather than
-	// importing another adapter.
-	orgsDirName     = "protean-organizations"
-	projectsDirName = "projects"
 
 	// maskDirName is a single shared, empty, read-only directory mounted over
 	// /workspace/.protean in every sandbox.
@@ -594,10 +589,10 @@ type hostLayout struct {
 // sees the real paths (macOS temp dirs are symlinks into /private).
 func (r *Runtime) prepareHost(ref ports.ProjectRef) (hostLayout, error) {
 	projectDir := r.ProjectDir(ref)
-	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+	if err := os.MkdirAll(projectDir, layout.DirMode); err != nil {
 		return hostLayout{}, fmt.Errorf("create project dir: %w", err)
 	}
-	if err := os.MkdirAll(filepath.Join(projectDir, sandbox.ControlDirName), 0o700); err != nil {
+	if err := os.MkdirAll(layout.ProjectProteanDir(r.opts.DataDir, ref.OrgID, ref.ProjectID), layout.ControlDirMode); err != nil {
 		return hostLayout{}, fmt.Errorf("create control dir: %w", err)
 	}
 
@@ -610,7 +605,7 @@ func (r *Runtime) prepareHost(ref ports.ProjectRef) (hostLayout, error) {
 	if err != nil {
 		return hostLayout{}, fmt.Errorf("resolve project directory: %w", err)
 	}
-	agentsFile := filepath.Join(projectDir, sandbox.AgentsFileName)
+	agentsFile := layout.ProjectAgentsMD(r.opts.DataDir, ref.OrgID, ref.ProjectID)
 	f, err := os.OpenFile(agentsFile, os.O_RDONLY|os.O_CREATE, 0o644)
 	if err != nil {
 		if err := os.Remove(agentsFile); err != nil {
@@ -658,7 +653,7 @@ func pathWithin(root, candidate string) bool {
 
 // ProjectDir is the host directory bind-mounted at the workspace root.
 func (r *Runtime) ProjectDir(ref ports.ProjectRef) string {
-	return filepath.Join(r.opts.DataDir, orgsDirName, ref.OrgID, projectsDirName, ref.ProjectID)
+	return layout.ProjectDir(r.opts.DataDir, ref.OrgID, ref.ProjectID)
 }
 
 // Stop stops the sandbox and frees its slot. Missing or already-stopped
