@@ -1,10 +1,7 @@
-# Protean repo guidelines
-
-- The repository uses bun for all the typescript apps and packages.
-- Always run the unit tests after a unit of work to ensure you are not regressing.
-- However, skip running the heavy duty integration tests unless its necessary.
-- When working in the apps/webapp/ always think first of choose the right skill to load.
-  - When it's frontend work choose the "frontend-skill"
-    - For the frontend work prefer using "shadcn-ui" skill and shadcn ui over manual work.
-    - However, the frontend parts that are related to the AI chat use "ai-elements" skill and ai-elements over manual work.
-  - When asked for reviews and analysis of the code for finding improvement areas use the "vercel-react-best-practices" with
+- `v3` is the base branch for this work not `main`.
+- **Task Management**
+  - https://github.com/users/sifatulrabbi/projects/4 is the project for this work and where the tracking happens.
+  - Whenever new task needs to be created add that to the backlog in that project.
+  - As you move with the tasks update their statuses as well; Ready -> In progress -> In review -> Done.
+  - Only pick up tasks that are in Ready state.
+  - Never start working on a task that's not in the project instead suggest creating the task in the project first.
