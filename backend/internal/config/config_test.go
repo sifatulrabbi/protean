@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseLine(t *testing.T) {
@@ -62,7 +63,8 @@ func TestLoadFrom(t *testing.T) {
 	clearEnv := func(t *testing.T) {
 		t.Helper()
 		for _, k := range []string{
-			"PROTEAN_API_PORT", "PROTEAN_DATA_DIR",
+			"PROTEAN_API_PORT", "PROTEAN_DATA_DIR", "PROTEAN_SQLITE_DB_PATH",
+			"PROTEAN_ENTITLEMENTS_WATCH_INTERVAL", "PROTEAN_HOST_DISK_WATERMARK_PCT",
 			"OPENROUTER_API_KEY", "OPENAI_API_KEY", "TAVILY_API_KEY",
 		} {
 			t.Setenv(k, "")
@@ -84,6 +86,64 @@ func TestLoadFrom(t *testing.T) {
 		}
 		if cfg.Addr() != ":8788" {
 			t.Errorf("Addr() = %q, want %q", cfg.Addr(), ":8788")
+		}
+		wantDB := filepath.Join(filepath.Clean(DefaultDataDir), DefaultSQLiteDBFile)
+		if cfg.SQLiteDBPath != wantDB {
+			t.Errorf("SQLiteDBPath = %q, want %q", cfg.SQLiteDBPath, wantDB)
+		}
+		if cfg.EntitlementsWatchInterval != DefaultEntitlementsWatchInterval {
+			t.Errorf("EntitlementsWatchInterval = %s, want %s", cfg.EntitlementsWatchInterval, DefaultEntitlementsWatchInterval)
+		}
+		if cfg.HostDiskWatermarkPct != DefaultHostDiskWatermarkPct {
+			t.Errorf("HostDiskWatermarkPct = %d, want %d", cfg.HostDiskWatermarkPct, DefaultHostDiskWatermarkPct)
+		}
+	})
+
+	t.Run("entitlements overrides", func(t *testing.T) {
+		clearEnv(t)
+		path := writeEnv(t, "PROTEAN_DATA_DIR=/var/protean\nPROTEAN_ENTITLEMENTS_WATCH_INTERVAL=5s\nPROTEAN_HOST_DISK_WATERMARK_PCT=90\n")
+		cfg, err := LoadFrom(path)
+		if err != nil {
+			t.Fatalf("LoadFrom: %v", err)
+		}
+		if cfg.EntitlementsWatchInterval != 5*time.Second {
+			t.Errorf("EntitlementsWatchInterval = %s, want 5s", cfg.EntitlementsWatchInterval)
+		}
+		if cfg.HostDiskWatermarkPct != 90 {
+			t.Errorf("HostDiskWatermarkPct = %d, want 90", cfg.HostDiskWatermarkPct)
+		}
+		if want := filepath.Join("/var/protean", DefaultSQLiteDBFile); cfg.SQLiteDBPath != want {
+			t.Errorf("SQLiteDBPath = %q, want %q", cfg.SQLiteDBPath, want)
+		}
+	})
+
+	t.Run("explicit sqlite path wins over data dir", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("PROTEAN_SQLITE_DB_PATH", "/srv/db/protean.db")
+		cfg, err := LoadFrom("")
+		if err != nil {
+			t.Fatalf("LoadFrom: %v", err)
+		}
+		if cfg.SQLiteDBPath != "/srv/db/protean.db" {
+			t.Errorf("SQLiteDBPath = %q, want /srv/db/protean.db", cfg.SQLiteDBPath)
+		}
+	})
+
+	t.Run("invalid entitlements values", func(t *testing.T) {
+		for _, tc := range []struct{ key, value string }{
+			{"PROTEAN_ENTITLEMENTS_WATCH_INTERVAL", "soon"},
+			{"PROTEAN_ENTITLEMENTS_WATCH_INTERVAL", "-1s"},
+			{"PROTEAN_HOST_DISK_WATERMARK_PCT", "many"},
+			{"PROTEAN_HOST_DISK_WATERMARK_PCT", "0"},
+			{"PROTEAN_HOST_DISK_WATERMARK_PCT", "101"},
+		} {
+			t.Run(tc.key+"="+tc.value, func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv(tc.key, tc.value)
+				if _, err := LoadFrom(""); err == nil {
+					t.Fatalf("want error for %s=%s", tc.key, tc.value)
+				}
+			})
 		}
 	})
 
