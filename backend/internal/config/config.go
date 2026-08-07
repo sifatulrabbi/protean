@@ -27,6 +27,10 @@ const (
 	// DefaultHostDiskWatermarkPct is the host disk usage percentage at which
 	// the global out-of-space switch turns on.
 	DefaultHostDiskWatermarkPct = 80
+
+	// DefaultLLMReserveTokens is the estimated token hold for one in-flight LLM
+	// invocation.
+	DefaultLLMReserveTokens int64 = 50_000
 )
 
 type Config struct {
@@ -39,6 +43,7 @@ type Config struct {
 
 	EntitlementsWatchInterval time.Duration
 	HostDiskWatermarkPct      int
+	LLMReserveTokens          int64
 }
 
 func (c Config) Addr() string { return fmt.Sprintf(":%d", c.APIPort) }
@@ -63,6 +68,7 @@ func LoadFrom(envFile string) (Config, error) {
 		TavilyAPIKey:              os.Getenv("TAVILY_API_KEY"),
 		EntitlementsWatchInterval: DefaultEntitlementsWatchInterval,
 		HostDiskWatermarkPct:      DefaultHostDiskWatermarkPct,
+		LLMReserveTokens:          DefaultLLMReserveTokens,
 	}
 
 	if v := os.Getenv("PROTEAN_API_PORT"); v != "" {
@@ -99,6 +105,16 @@ func LoadFrom(envFile string) (Config, error) {
 			return Config{}, fmt.Errorf("PROTEAN_HOST_DISK_WATERMARK_PCT %d out of range", pct)
 		}
 		cfg.HostDiskWatermarkPct = pct
+	}
+	if v := os.Getenv("PROTEAN_LLM_RESERVE_TOKENS"); v != "" {
+		tokens, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return Config{}, fmt.Errorf("PROTEAN_LLM_RESERVE_TOKENS %q: %w", v, err)
+		}
+		if tokens <= 0 {
+			return Config{}, fmt.Errorf("PROTEAN_LLM_RESERVE_TOKENS %d must be positive", tokens)
+		}
+		cfg.LLMReserveTokens = tokens
 	}
 
 	cfg.SQLiteDBPath = filepath.Join(cfg.DataDir, DefaultSQLiteDBFile)

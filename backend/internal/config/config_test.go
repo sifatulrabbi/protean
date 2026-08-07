@@ -65,6 +65,7 @@ func TestLoadFrom(t *testing.T) {
 		for _, k := range []string{
 			"PROTEAN_API_PORT", "PROTEAN_DATA_DIR", "PROTEAN_SQLITE_DB_PATH",
 			"PROTEAN_ENTITLEMENTS_WATCH_INTERVAL", "PROTEAN_HOST_DISK_WATERMARK_PCT",
+			"PROTEAN_LLM_RESERVE_TOKENS",
 			"OPENROUTER_API_KEY", "OPENAI_API_KEY", "TAVILY_API_KEY",
 		} {
 			t.Setenv(k, "")
@@ -97,11 +98,14 @@ func TestLoadFrom(t *testing.T) {
 		if cfg.HostDiskWatermarkPct != DefaultHostDiskWatermarkPct {
 			t.Errorf("HostDiskWatermarkPct = %d, want %d", cfg.HostDiskWatermarkPct, DefaultHostDiskWatermarkPct)
 		}
+		if cfg.LLMReserveTokens != DefaultLLMReserveTokens {
+			t.Errorf("LLMReserveTokens = %d, want %d", cfg.LLMReserveTokens, DefaultLLMReserveTokens)
+		}
 	})
 
 	t.Run("entitlements overrides", func(t *testing.T) {
 		clearEnv(t)
-		path := writeEnv(t, "PROTEAN_DATA_DIR=/var/protean\nPROTEAN_ENTITLEMENTS_WATCH_INTERVAL=5s\nPROTEAN_HOST_DISK_WATERMARK_PCT=90\n")
+		path := writeEnv(t, "PROTEAN_DATA_DIR=/var/protean\nPROTEAN_ENTITLEMENTS_WATCH_INTERVAL=5s\nPROTEAN_HOST_DISK_WATERMARK_PCT=90\nPROTEAN_LLM_RESERVE_TOKENS=12345\n")
 		cfg, err := LoadFrom(path)
 		if err != nil {
 			t.Fatalf("LoadFrom: %v", err)
@@ -111,6 +115,9 @@ func TestLoadFrom(t *testing.T) {
 		}
 		if cfg.HostDiskWatermarkPct != 90 {
 			t.Errorf("HostDiskWatermarkPct = %d, want 90", cfg.HostDiskWatermarkPct)
+		}
+		if cfg.LLMReserveTokens != 12345 {
+			t.Errorf("LLMReserveTokens = %d, want 12345", cfg.LLMReserveTokens)
 		}
 		if want := filepath.Join("/var/protean", DefaultSQLiteDBFile); cfg.SQLiteDBPath != want {
 			t.Errorf("SQLiteDBPath = %q, want %q", cfg.SQLiteDBPath, want)
@@ -136,6 +143,9 @@ func TestLoadFrom(t *testing.T) {
 			{"PROTEAN_HOST_DISK_WATERMARK_PCT", "many"},
 			{"PROTEAN_HOST_DISK_WATERMARK_PCT", "0"},
 			{"PROTEAN_HOST_DISK_WATERMARK_PCT", "101"},
+			{"PROTEAN_LLM_RESERVE_TOKENS", "many"},
+			{"PROTEAN_LLM_RESERVE_TOKENS", "0"},
+			{"PROTEAN_LLM_RESERVE_TOKENS", "-1"},
 		} {
 			t.Run(tc.key+"="+tc.value, func(t *testing.T) {
 				clearEnv(t)

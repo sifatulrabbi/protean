@@ -12,6 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/sifatulrabbi/protean/backend/internal/entitlements"
+	"github.com/sifatulrabbi/protean/backend/internal/ports"
 )
 
 // schema is applied on every open; it is idempotent.
@@ -60,12 +61,22 @@ func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) DB() *sql.DB { return s.db }
 
 func (s *Store) AddUsage(ctx context.Context, orgID, month string, inputTokens, outputTokens int64) error {
+	if inputTokens < 0 || outputTokens < 0 {
+		return ports.ErrInvalidTokenUsage
+	}
+
 	const q = `
 INSERT INTO token_usage (org_id, month, input_tokens, output_tokens)
 VALUES (?, ?, ?, ?)
 ON CONFLICT (org_id, month) DO UPDATE SET
-	input_tokens  = input_tokens  + excluded.input_tokens,
-	output_tokens = output_tokens + excluded.output_tokens;`
+	input_tokens = CASE
+		WHEN input_tokens > 9223372036854775807 - excluded.input_tokens THEN 9223372036854775807
+		ELSE input_tokens + excluded.input_tokens
+	END,
+	output_tokens = CASE
+		WHEN output_tokens > 9223372036854775807 - excluded.output_tokens THEN 9223372036854775807
+		ELSE output_tokens + excluded.output_tokens
+	END;`
 
 	if _, err := s.db.ExecContext(ctx, q, orgID, month, inputTokens, outputTokens); err != nil {
 		return fmt.Errorf("add token usage %s/%s: %w", orgID, month, err)

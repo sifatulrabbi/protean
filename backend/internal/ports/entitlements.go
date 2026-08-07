@@ -28,13 +28,15 @@ type Entitlements interface {
 	CheckDiskWrite(ctx context.Context, orgID string, deltaBytes int64) error
 
 	// CheckLLMInvocation fails with ErrNoCredits when the org has spent its
-	// token allowance for the current calendar month.
+	// token allowance for the current calendar month or its remaining allowance
+	// is held by an in-flight reservation.
 	CheckLLMInvocation(ctx context.Context, orgID string) error
 
 	// RecordTokenUsage adds a completed invocation's tokens to the org's
 	// counter for the current calendar month. It is called after the fact and
-	// never rejects; overshoot on the last invocation is accepted and the org
-	// loses credits until the month rolls over.
+	// rejects negative usage with ErrInvalidTokenUsage. Overshoot on the last
+	// invocation is accepted and the org loses credits until the month rolls
+	// over.
 	RecordTokenUsage(ctx context.Context, orgID string, inputTokens, outputTokens int64) error
 
 	// CanAddMember fails with ErrMemberCapReached when the org is full.
@@ -53,6 +55,46 @@ type Entitlements interface {
 	// Subscribe registers fn for meter events. fn is called synchronously from
 	// whichever goroutine crossed the threshold, so it must not block.
 	Subscribe(fn func(MeterEvent))
+}
+
+// ReservingEntitlements extends Entitlements with atomic, single-host
+// reservation and structural-admission operations. It is a separate extension
+// interface so existing Entitlements implementations remain source-compatible.
+type ReservingEntitlements interface {
+	Entitlements
+
+	// ReserveLLMInvocation atomically holds the org's remaining token allowance
+	// for one invocation. The caller must settle the reservation with the
+	// provider-reported usage, or release it when the invocation fails.
+	ReserveLLMInvocation(ctx context.Context, orgID string) (LLMReservation, error)
+
+	// ReserveMemberSlot checks the member cap while holding per-org admission.
+	// The caller must release the handle after its membership mutation commits
+	// or fails.
+	ReserveMemberSlot(ctx context.Context, orgID string) (StructuralAdmission, error)
+
+	// ReserveOrgSlot checks the owned-org cap while holding per-user admission.
+	// The caller must release the handle after its org mutation commits or fails.
+	ReserveOrgSlot(ctx context.Context, userID string) (StructuralAdmission, error)
+
+	// ReserveProjectSlot checks the project cap while holding per-org admission.
+	// The caller must release the handle after its project mutation commits or
+	// fails.
+	ReserveProjectSlot(ctx context.Context, orgID string) (StructuralAdmission, error)
+}
+
+// LLMReservation is a single-use hold on an org's token allowance. Settle
+// records actual provider usage and closes the reservation. Release closes it
+// without recording usage.
+type LLMReservation interface {
+	Settle(ctx context.Context, inputTokens, outputTokens int64) error
+	Release()
+}
+
+// StructuralAdmission holds a per-scope lock across a structural mutation.
+// Release must be called after the mutation commits or fails.
+type StructuralAdmission interface {
+	Release()
 }
 
 // Meters is a point-in-time view of one org's usage against its plan.
@@ -94,6 +136,7 @@ const (
 // threshold upwards. Events are rising-edge only: repeated measurements above
 // the same threshold emit nothing. Usage that falls back below a threshold
 // re-arms it, so a later crossing fires again.
+// Rising-edge state is intentionally memory-only for this MVP.
 type MeterEvent struct {
 	OrgID        string
 	Resource     MeterResource
@@ -147,5 +190,9 @@ var (
 	ErrProjectCapReached = &EntitlementError{
 		Code:    "project_cap_reached",
 		Message: "This organization already has the maximum number of projects included in your plan. Delete a project or upgrade your plan for more.",
+	}
+	ErrInvalidTokenUsage = &EntitlementError{
+		Code:    "invalid_token_usage",
+		Message: "Token usage cannot be negative.",
 	}
 )

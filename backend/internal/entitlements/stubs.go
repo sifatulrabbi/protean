@@ -2,9 +2,9 @@ package entitlements
 
 import "context"
 
-// ZeroCounts is a placeholder StructuralCounts that reports every count as
-// zero, so the structural caps never reject. It is wired at boot until the
-// organization data store lands.
+// ZeroCounts is an UNENFORCED placeholder StructuralCounts. It reports every
+// count as zero, so structural caps never reject; production must replace it
+// when the metadata store lands.
 type ZeroCounts struct{}
 
 var _ StructuralCounts = ZeroCounts{}

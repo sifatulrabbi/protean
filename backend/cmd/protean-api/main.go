@@ -47,6 +47,8 @@ func run(logger *slog.Logger) error {
 	defer tokenStore.Close()
 
 	plan := entitlements.Free()
+	logger.Warn("entitlements: structural caps are not enforced",
+		"reason", "metadata counts adapter is not available; using ZeroCounts placeholder")
 	engine := entitlements.New(entitlements.Deps{
 		Plan:             plan,
 		TokenUsage:       tokenStore,
@@ -56,6 +58,7 @@ func run(logger *slog.Logger) error {
 		Logger:           logger,
 		WatchInterval:    cfg.EntitlementsWatchInterval,
 		HostWatermarkPct: cfg.HostDiskWatermarkPct,
+		LLMReserveTokens: cfg.LLMReserveTokens,
 	})
 	watcherCtx, stopWatcher := context.WithCancel(ctx)
 	defer func() {

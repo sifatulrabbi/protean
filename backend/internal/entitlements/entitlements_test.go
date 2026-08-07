@@ -3,9 +3,12 @@ package entitlements
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"reflect"
+	"sync"
 	"testing"
 	"time"
 
@@ -138,6 +141,203 @@ func TestNoCreditsSwitchAndMonthlyReset(t *testing.T) {
 	}
 }
 
+func TestConcurrentLLMReservationsNearCapDoNotOvershoot(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	remaining := int64(10)
+	if err := h.engine.RecordTokenUsage(ctx, "org-1", h.plan.MonthlyTokenLimit-remaining, 0); err != nil {
+		t.Fatalf("RecordTokenUsage: %v", err)
+	}
+
+	const invocations = 32
+	start := make(chan struct{})
+	results := make(chan ports.LLMReservation, invocations)
+	errs := make(chan error, invocations)
+	var wg sync.WaitGroup
+	for range invocations {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			reservation, err := h.engine.ReserveLLMInvocation(ctx, "org-1")
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- reservation
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	var reservations []ports.LLMReservation
+	for reservation := range results {
+		reservations = append(reservations, reservation)
+	}
+	if len(reservations) != 1 {
+		t.Fatalf("successful reservations = %d, want 1", len(reservations))
+	}
+	for err := range errs {
+		if !errors.Is(err, ports.ErrNoCredits) {
+			t.Errorf("reservation error = %v, want ErrNoCredits", err)
+		}
+	}
+	if err := reservations[0].Settle(ctx, remaining, 0); err != nil {
+		t.Fatalf("Settle: %v", err)
+	}
+
+	meters, err := h.engine.Meters(ctx, "org-1")
+	if err != nil {
+		t.Fatalf("Meters: %v", err)
+	}
+	if meters.TokensUsed != h.plan.MonthlyTokenLimit {
+		t.Fatalf("TokensUsed = %d, want %d", meters.TokensUsed, h.plan.MonthlyTokenLimit)
+	}
+}
+
+func TestLLMReservationsAllowConcurrencyWhenBudgetIsPlentiful(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	const concurrent = 5
+	start := make(chan struct{})
+	results := make(chan ports.LLMReservation, concurrent)
+	errs := make(chan error, concurrent)
+	var wg sync.WaitGroup
+	for i := range concurrent {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			reservation, err := h.engine.ReserveLLMInvocation(ctx, "org-1")
+			if err != nil {
+				errs <- fmt.Errorf("reservation %d: %w", i+1, err)
+				return
+			}
+			results <- reservation
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		t.Error(err)
+	}
+	reservations := make([]ports.LLMReservation, 0, concurrent)
+	for reservation := range results {
+		reservations = append(reservations, reservation)
+	}
+	if len(reservations) != concurrent {
+		t.Fatalf("successful reservations = %d, want %d", len(reservations), concurrent)
+	}
+	if err := h.engine.CheckLLMInvocation(ctx, "org-1"); err != nil {
+		t.Fatalf("CheckLLMInvocation with %d reservations: %v", concurrent, err)
+	}
+	for _, reservation := range reservations {
+		reservation.Release()
+	}
+
+	next, err := h.engine.ReserveLLMInvocation(ctx, "org-1")
+	if err != nil {
+		t.Fatalf("reservation after release: %v", err)
+	}
+	next.Release()
+}
+
+func TestLLMReservationsUseBoundedEstimate(t *testing.T) {
+	plan := Free()
+	plan.MonthlyTokenLimit = 100
+	tokens := newFakeTokenStore()
+	engine := New(Deps{
+		Plan:             plan,
+		TokenUsage:       tokens,
+		Disk:             newFakeDisk(),
+		Counts:           newFakeCounts(),
+		Clock:            newFakeClock(t, "2026-03-15T10:00:00Z"),
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		LLMReserveTokens: 10,
+	})
+	ctx := context.Background()
+	if err := engine.RecordTokenUsage(ctx, "org-1", 5, 0); err != nil {
+		t.Fatalf("RecordTokenUsage: %v", err)
+	}
+
+	var reservations []ports.LLMReservation
+	for {
+		reservation, err := engine.ReserveLLMInvocation(ctx, "org-1")
+		if errors.Is(err, ports.ErrNoCredits) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("ReserveLLMInvocation: %v", err)
+		}
+		reservations = append(reservations, reservation)
+	}
+	if got, wantAtLeast := len(reservations), 95/10; got < wantAtLeast {
+		t.Fatalf("simultaneous reservations = %d, want at least %d", got, wantAtLeast)
+	}
+	if got := len(reservations); got != 10 {
+		t.Fatalf("simultaneous reservations = %d, want 10 including the final 5-token remainder", got)
+	}
+	for _, reservation := range reservations {
+		reservation.Release()
+	}
+}
+
+func TestLLMReservationSettleFailureReleasesAdmission(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	reservation, err := h.engine.ReserveLLMInvocation(ctx, "org-1")
+	if err != nil {
+		t.Fatalf("reservation: %v", err)
+	}
+	h.tokens.err = errors.New("write failed")
+	if err := reservation.Settle(ctx, 1, 1); err == nil {
+		t.Fatal("Settle = nil, want store error")
+	}
+	h.tokens.err = nil
+
+	next, err := h.engine.ReserveLLMInvocation(ctx, "org-1")
+	if err != nil {
+		t.Fatalf("reservation after settle failure: %v", err)
+	}
+	next.Release()
+}
+
+func TestRecordTokenUsageRejectsNegativeValues(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	tests := []struct {
+		name   string
+		input  int64
+		output int64
+	}{
+		{name: "negative input", input: -1},
+		{name: "negative output", output: -1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := h.engine.RecordTokenUsage(ctx, "org-1", tc.input, tc.output); !errors.Is(err, ports.ErrInvalidTokenUsage) {
+				t.Fatalf("RecordTokenUsage = %v, want ErrInvalidTokenUsage", err)
+			}
+		})
+	}
+
+	meters, err := h.engine.Meters(ctx, "org-1")
+	if err != nil {
+		t.Fatalf("Meters: %v", err)
+	}
+	if meters.TokensUsed != 0 {
+		t.Fatalf("TokensUsed = %d, want 0", meters.TokensUsed)
+	}
+}
+
 func TestStructuralCaps(t *testing.T) {
 	plan := Free()
 
@@ -197,6 +397,41 @@ func TestStructuralCaps(t *testing.T) {
 				t.Fatalf("check = %v, want %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestStructuralAdmissionHeldAcrossMutation(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	h.counts.orgs["user-1"] = h.plan.MaxOwnedOrgsPerUser - 1
+
+	first, err := h.engine.ReserveOrgSlot(ctx, "user-1")
+	if err != nil {
+		t.Fatalf("first reservation: %v", err)
+	}
+
+	result := make(chan error, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		admission, err := h.engine.ReserveOrgSlot(ctx, "user-1")
+		if admission != nil {
+			admission.Release()
+		}
+		result <- err
+	}()
+	<-started
+
+	select {
+	case err := <-result:
+		t.Fatalf("second admission returned before first mutation completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	h.counts.orgs["user-1"]++
+	first.Release()
+	if err := <-result; !errors.Is(err, ports.ErrOrgCapReached) {
+		t.Fatalf("second admission = %v, want ErrOrgCapReached", err)
 	}
 }
 
@@ -426,6 +661,81 @@ func TestDiskMeasurementCachedUntilStale(t *testing.T) {
 	}
 	if meters.DiskUsedBytes != 2_000 {
 		t.Fatalf("DiskUsedBytes = %d, want the re-measured 2000", meters.DiskUsedBytes)
+	}
+}
+
+func TestStaleDiskMeasurementDoesNotReplaceNewerValue(t *testing.T) {
+	clk := newFakeClock(t, "2026-03-15T10:00:00Z")
+	engine := New(Deps{
+		Plan:             Free(),
+		TokenUsage:       newFakeTokenStore(),
+		Disk:             newFakeDisk(),
+		Counts:           newFakeCounts(),
+		Clock:            clk,
+		Logger:           slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WatchInterval:    time.Hour,
+		HostWatermarkPct: 80,
+	})
+	newer := clk.Now()
+	older := newer.Add(-time.Minute)
+	engine.applyOrgDisk("org-1", engine.plan.DiskLimitBytes, newer)
+	engine.applyOrgDisk("org-1", 0, older)
+
+	if err := engine.CheckDiskWrite(context.Background(), "org-1", 1); !errors.Is(err, ports.ErrOrgReadOnly) {
+		t.Fatalf("CheckDiskWrite after stale measurement = %v, want ErrOrgReadOnly", err)
+	}
+	meters, err := engine.Meters(context.Background(), "org-1")
+	if err != nil {
+		t.Fatalf("Meters: %v", err)
+	}
+	if meters.DiskUsedBytes != engine.plan.DiskLimitBytes || !meters.MeasuredAt.Equal(newer) {
+		t.Fatalf("Meters = %+v, want newer at-cap measurement", meters)
+	}
+}
+
+func TestTokenMonthNeverMovesBackward(t *testing.T) {
+	h := newHarness(t)
+	limit := h.plan.MonthlyTokenLimit
+
+	if got := h.engine.applyTokenUsage("org-1", "2026-04", limit); len(got) != 3 {
+		t.Fatalf("April crossings = %d, want 3", len(got))
+	}
+	if got := h.engine.applyTokenUsage("org-1", "2026-03", 0); got != nil {
+		t.Fatalf("stale March usage emitted %v, want none", got)
+	}
+	if got := h.engine.applyTokenUsage("org-1", "2026-04", limit); got != nil {
+		t.Fatalf("April threshold re-fired after stale month: %v", got)
+	}
+
+	h.engine.mu.Lock()
+	month := h.engine.stateLocked("org-1").tokenMonth
+	h.engine.mu.Unlock()
+	if month != "2026-04" {
+		t.Fatalf("tokenMonth = %q, want 2026-04", month)
+	}
+}
+
+func TestOverflowSafeAuthorityComparisons(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	h.disk.setOrg("org-1", h.plan.DiskLimitBytes-1)
+	if err := h.engine.CheckDiskWrite(ctx, "org-1", math.MaxInt64); !errors.Is(err, ports.ErrDiskQuotaExceeded) {
+		t.Fatalf("overflowing disk delta = %v, want ErrDiskQuotaExceeded", err)
+	}
+
+	h.tokens.usage[usageKey{orgID: "org-2", month: "2026-03"}] = [2]int64{math.MaxInt64, math.MaxInt64}
+	if err := h.engine.CheckLLMInvocation(ctx, "org-2"); !errors.Is(err, ports.ErrNoCredits) {
+		t.Fatalf("overflowing token total = %v, want ErrNoCredits", err)
+	}
+
+	if got := thresholdLevel(math.MaxInt64, math.MaxInt64); got != len(ports.MeterThresholds) {
+		t.Fatalf("thresholdLevel(MaxInt64, MaxInt64) = %d, want %d", got, len(ports.MeterThresholds))
+	}
+
+	h.disk.setHost(0, math.MaxInt64)
+	if err := h.engine.CheckDiskWrite(ctx, "org-3", 1); !errors.Is(err, ports.ErrOutOfSpace) {
+		t.Fatalf("MaxInt64 host usage = %v, want ErrOutOfSpace", err)
 	}
 }
 

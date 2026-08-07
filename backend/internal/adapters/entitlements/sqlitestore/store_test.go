@@ -2,8 +2,12 @@ package sqlitestore
 
 import (
 	"context"
+	"errors"
+	"math"
 	"path/filepath"
 	"testing"
+
+	"github.com/sifatulrabbi/protean/backend/internal/ports"
 )
 
 func openTemp(t *testing.T) *Store {
@@ -86,5 +90,56 @@ func TestOpenIsIdempotentAndPersists(t *testing.T) {
 	}
 	if in != 5 || out != 6 {
 		t.Fatalf("UsageForMonth = (%d, %d), want (5, 6)", in, out)
+	}
+}
+
+func TestAddUsageRejectsNegativeAndNeverAccumulatesBelowZero(t *testing.T) {
+	ctx := context.Background()
+	store := openTemp(t)
+
+	if err := store.AddUsage(ctx, "org-1", "2026-03", 10, 20); err != nil {
+		t.Fatalf("AddUsage: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		input  int64
+		output int64
+	}{
+		{name: "negative input", input: -1},
+		{name: "negative output", output: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := store.AddUsage(ctx, "org-1", "2026-03", tc.input, tc.output); !errors.Is(err, ports.ErrInvalidTokenUsage) {
+				t.Fatalf("AddUsage = %v, want ErrInvalidTokenUsage", err)
+			}
+		})
+	}
+
+	in, out, err := store.UsageForMonth(ctx, "org-1", "2026-03")
+	if err != nil {
+		t.Fatalf("UsageForMonth: %v", err)
+	}
+	if in != 10 || out != 20 {
+		t.Fatalf("UsageForMonth = (%d, %d), want (10, 20)", in, out)
+	}
+}
+
+func TestAddUsageSaturatesInsteadOfOverflowingNegative(t *testing.T) {
+	ctx := context.Background()
+	store := openTemp(t)
+
+	if err := store.AddUsage(ctx, "org-1", "2026-03", math.MaxInt64, math.MaxInt64); err != nil {
+		t.Fatalf("first AddUsage: %v", err)
+	}
+	if err := store.AddUsage(ctx, "org-1", "2026-03", 1, 1); err != nil {
+		t.Fatalf("overflow AddUsage: %v", err)
+	}
+
+	in, out, err := store.UsageForMonth(ctx, "org-1", "2026-03")
+	if err != nil {
+		t.Fatalf("UsageForMonth: %v", err)
+	}
+	if in != math.MaxInt64 || out != math.MaxInt64 {
+		t.Fatalf("UsageForMonth = (%d, %d), want saturated MaxInt64", in, out)
 	}
 }

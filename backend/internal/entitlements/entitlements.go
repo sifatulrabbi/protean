@@ -7,11 +7,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/bits"
 	"sync"
 	"time"
 
 	"github.com/sifatulrabbi/protean/backend/internal/ports"
 )
+
+const defaultLLMReserveTokens int64 = 50_000
 
 // TokenUsageStore persists AI token counters, keyed by org and calendar month
 // ("YYYY-MM"). Counters only ever grow inside a month; a new month starts at
@@ -50,6 +53,7 @@ type Deps struct {
 	Logger           *slog.Logger
 	WatchInterval    time.Duration
 	HostWatermarkPct int
+	LLMReserveTokens int64
 }
 
 // Engine implements ports.Entitlements. Switch state lives in memory; only the
@@ -63,13 +67,30 @@ type Engine struct {
 	logger       *slog.Logger
 	interval     time.Duration
 	watermarkPct int
+	llmReserve   int64
 
 	mu         sync.Mutex
 	outOfSpace bool
 	orgs       map[string]*orgState
 	subs       []func(ports.MeterEvent)
 
+	tokenMu       sync.Mutex
+	tokenReserved map[tokenScope]int64
+
+	admissionMu    sync.Mutex
+	admissionLocks map[structuralScope]chan struct{}
+
 	wg sync.WaitGroup
+}
+
+type tokenScope struct {
+	orgID string
+	month string
+}
+
+type structuralScope struct {
+	kind string
+	id   string
 }
 
 // orgState is the cached, mutable per-org view the switches are derived from.
@@ -84,6 +105,7 @@ type orgState struct {
 }
 
 var _ ports.Entitlements = (*Engine)(nil)
+var _ ports.ReservingEntitlements = (*Engine)(nil)
 
 func New(deps Deps) *Engine {
 	logger := deps.Logger
@@ -102,17 +124,24 @@ func New(deps Deps) *Engine {
 	if watermark <= 0 || watermark > 100 {
 		watermark = 100
 	}
+	llmReserve := deps.LLMReserveTokens
+	if llmReserve <= 0 {
+		llmReserve = defaultLLMReserveTokens
+	}
 
 	return &Engine{
-		plan:         plan,
-		tokens:       deps.TokenUsage,
-		disk:         deps.Disk,
-		counts:       deps.Counts,
-		clock:        deps.Clock,
-		logger:       logger,
-		interval:     interval,
-		watermarkPct: watermark,
-		orgs:         map[string]*orgState{},
+		plan:           plan,
+		tokens:         deps.TokenUsage,
+		disk:           deps.Disk,
+		counts:         deps.Counts,
+		clock:          deps.Clock,
+		logger:         logger,
+		interval:       interval,
+		watermarkPct:   watermark,
+		llmReserve:     llmReserve,
+		orgs:           map[string]*orgState{},
+		tokenReserved:  map[tokenScope]int64{},
+		admissionLocks: map[structuralScope]chan struct{}{},
 	}
 }
 
@@ -146,7 +175,7 @@ func (e *Engine) CheckDiskWrite(ctx context.Context, orgID string, deltaBytes in
 	switch {
 	case used >= e.plan.DiskLimitBytes:
 		return ports.ErrOrgReadOnly
-	case used+deltaBytes > e.plan.DiskLimitBytes:
+	case deltaBytes > e.plan.DiskLimitBytes-used:
 		return ports.ErrDiskQuotaExceeded
 	case outOfSpace:
 		return ports.ErrOutOfSpace
@@ -156,28 +185,72 @@ func (e *Engine) CheckDiskWrite(ctx context.Context, orgID string, deltaBytes in
 
 func (e *Engine) CheckLLMInvocation(ctx context.Context, orgID string) error {
 	month := e.month()
+	e.tokenMu.Lock()
+	defer e.tokenMu.Unlock()
+
 	in, out, err := e.tokens.UsageForMonth(ctx, orgID, month)
 	if err != nil {
 		return fmt.Errorf("token usage for %s/%s: %w", orgID, month, err)
 	}
-	if in+out >= e.plan.MonthlyTokenLimit {
+	used := saturatingAddNonNegative(in, out)
+	reserved := e.tokenReserved[tokenScope{orgID: orgID, month: month}]
+	if sumAtLeastLimit(used, reserved, e.plan.MonthlyTokenLimit) {
 		return ports.ErrNoCredits
 	}
 	return nil
 }
 
-func (e *Engine) RecordTokenUsage(ctx context.Context, orgID string, inputTokens, outputTokens int64) error {
+func (e *Engine) ReserveLLMInvocation(ctx context.Context, orgID string) (ports.LLMReservation, error) {
 	month := e.month()
+	scope := tokenScope{orgID: orgID, month: month}
+
+	e.tokenMu.Lock()
+	defer e.tokenMu.Unlock()
+
+	in, out, err := e.tokens.UsageForMonth(ctx, orgID, month)
+	if err != nil {
+		return nil, fmt.Errorf("token usage for %s/%s: %w", orgID, month, err)
+	}
+	used := saturatingAddNonNegative(in, out)
+	reserved := e.tokenReserved[scope]
+	if sumAtLeastLimit(used, reserved, e.plan.MonthlyTokenLimit) {
+		return nil, ports.ErrNoCredits
+	}
+
+	// Reserve a bounded estimate while budget is plentiful. The final admission
+	// takes the smaller remainder so no later invocation can pass the cap.
+	remaining := e.plan.MonthlyTokenLimit - used - reserved
+	amount := min(remaining, e.llmReserve)
+	e.tokenReserved[scope] = reserved + amount
+	return &llmReservation{engine: e, scope: scope, amount: amount}, nil
+}
+
+func (e *Engine) RecordTokenUsage(ctx context.Context, orgID string, inputTokens, outputTokens int64) error {
+	if inputTokens < 0 || outputTokens < 0 {
+		return ports.ErrInvalidTokenUsage
+	}
+
+	month := e.month()
+	e.tokenMu.Lock()
+	used, err := e.addTokenUsageLocked(ctx, orgID, month, inputTokens, outputTokens)
+	e.tokenMu.Unlock()
+	if err != nil {
+		return err
+	}
+	e.emit(e.applyTokenUsage(orgID, month, used))
+	return nil
+}
+
+func (e *Engine) addTokenUsageLocked(ctx context.Context, orgID, month string, inputTokens, outputTokens int64) (int64, error) {
 	if err := e.tokens.AddUsage(ctx, orgID, month, inputTokens, outputTokens); err != nil {
-		return fmt.Errorf("record token usage for %s/%s: %w", orgID, month, err)
+		return 0, fmt.Errorf("record token usage for %s/%s: %w", orgID, month, err)
 	}
 
 	in, out, err := e.tokens.UsageForMonth(ctx, orgID, month)
 	if err != nil {
-		return fmt.Errorf("token usage for %s/%s: %w", orgID, month, err)
+		return 0, fmt.Errorf("token usage for %s/%s: %w", orgID, month, err)
 	}
-	e.emit(e.applyTokenUsage(orgID, month, in+out))
-	return nil
+	return saturatingAddNonNegative(in, out), nil
 }
 
 func (e *Engine) CanAddMember(ctx context.Context, orgID string) error {
@@ -191,6 +264,12 @@ func (e *Engine) CanAddMember(ctx context.Context, orgID string) error {
 	return nil
 }
 
+func (e *Engine) ReserveMemberSlot(ctx context.Context, orgID string) (ports.StructuralAdmission, error) {
+	return e.reserveStructural(ctx, structuralScope{kind: "member", id: orgID}, func() error {
+		return e.CanAddMember(ctx, orgID)
+	})
+}
+
 func (e *Engine) CanCreateOrg(ctx context.Context, userID string) error {
 	n, err := e.counts.OwnedOrgCount(ctx, userID)
 	if err != nil {
@@ -200,6 +279,12 @@ func (e *Engine) CanCreateOrg(ctx context.Context, userID string) error {
 		return ports.ErrOrgCapReached
 	}
 	return nil
+}
+
+func (e *Engine) ReserveOrgSlot(ctx context.Context, userID string) (ports.StructuralAdmission, error) {
+	return e.reserveStructural(ctx, structuralScope{kind: "org", id: userID}, func() error {
+		return e.CanCreateOrg(ctx, userID)
+	})
 }
 
 func (e *Engine) CanCreateProject(ctx context.Context, orgID string) error {
@@ -213,6 +298,99 @@ func (e *Engine) CanCreateProject(ctx context.Context, orgID string) error {
 	return nil
 }
 
+func (e *Engine) ReserveProjectSlot(ctx context.Context, orgID string) (ports.StructuralAdmission, error) {
+	return e.reserveStructural(ctx, structuralScope{kind: "project", id: orgID}, func() error {
+		return e.CanCreateProject(ctx, orgID)
+	})
+}
+
+type llmReservation struct {
+	engine *Engine
+	scope  tokenScope
+	amount int64
+
+	mu     sync.Mutex
+	closed bool
+}
+
+func (r *llmReservation) Settle(ctx context.Context, inputTokens, outputTokens int64) error {
+	if inputTokens < 0 || outputTokens < 0 {
+		return ports.ErrInvalidTokenUsage
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return fmt.Errorf("LLM reservation is already closed")
+	}
+
+	r.engine.tokenMu.Lock()
+	used, err := r.engine.addTokenUsageLocked(ctx, r.scope.orgID, r.scope.month, inputTokens, outputTokens)
+	r.engine.releaseTokenReservationLocked(r.scope, r.amount)
+	r.engine.tokenMu.Unlock()
+	r.closed = true
+	if err != nil {
+		return err
+	}
+	r.engine.emit(r.engine.applyTokenUsage(r.scope.orgID, r.scope.month, used))
+	return nil
+}
+
+func (r *llmReservation) Release() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+
+	r.engine.tokenMu.Lock()
+	r.engine.releaseTokenReservationLocked(r.scope, r.amount)
+	r.engine.tokenMu.Unlock()
+	r.closed = true
+}
+
+func (e *Engine) releaseTokenReservationLocked(scope tokenScope, amount int64) {
+	reserved := e.tokenReserved[scope]
+	if reserved <= amount {
+		delete(e.tokenReserved, scope)
+		return
+	}
+	e.tokenReserved[scope] = reserved - amount
+}
+
+type structuralAdmission struct {
+	once sync.Once
+	lock chan struct{}
+}
+
+func (a *structuralAdmission) Release() {
+	a.once.Do(func() { a.lock <- struct{}{} })
+}
+
+func (e *Engine) reserveStructural(ctx context.Context, scope structuralScope, check func() error) (ports.StructuralAdmission, error) {
+	e.admissionMu.Lock()
+	lock, ok := e.admissionLocks[scope]
+	if !ok {
+		lock = make(chan struct{}, 1)
+		lock <- struct{}{}
+		e.admissionLocks[scope] = lock
+	}
+	e.admissionMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-lock:
+	}
+
+	admission := &structuralAdmission{lock: lock}
+	if err := check(); err != nil {
+		admission.Release()
+		return nil, err
+	}
+	return admission, nil
+}
+
 func (e *Engine) Meters(ctx context.Context, orgID string) (ports.Meters, error) {
 	used, err := e.diskUsed(ctx, orgID)
 	if err != nil {
@@ -224,7 +402,7 @@ func (e *Engine) Meters(ctx context.Context, orgID string) (ports.Meters, error)
 	if err != nil {
 		return ports.Meters{}, fmt.Errorf("token usage for %s/%s: %w", orgID, month, err)
 	}
-	tokens := in + out
+	tokens := saturatingAddNonNegative(in, out)
 
 	e.mu.Lock()
 	outOfSpace := e.outOfSpace
@@ -309,7 +487,14 @@ func (e *Engine) refreshHost(ctx context.Context) {
 		return
 	}
 
-	usedPct := (total - free) * 100 / total
+	var used int64
+	switch {
+	case free <= 0:
+		used = total
+	case free < total:
+		used = total - free
+	}
+	usedPct := percentage(used, total)
 	on := usedPct >= int64(e.watermarkPct)
 
 	e.mu.Lock()
@@ -344,6 +529,10 @@ func (e *Engine) diskUsed(ctx context.Context, orgID string) (int64, error) {
 	}
 	e.emit(e.applyOrgDisk(orgID, used, now))
 	e.refreshHost(ctx)
+
+	e.mu.Lock()
+	used = e.stateLocked(orgID).diskBytes
+	e.mu.Unlock()
 	return used, nil
 }
 
@@ -352,6 +541,9 @@ func (e *Engine) applyOrgDisk(orgID string, used int64, now time.Time) []ports.M
 	defer e.mu.Unlock()
 
 	st := e.stateLocked(orgID)
+	if now.Before(st.measuredAt) {
+		return nil
+	}
 	wasReadOnly := st.diskBytes >= e.plan.DiskLimitBytes && !st.measuredAt.IsZero()
 	st.diskBytes = used
 	st.measuredAt = now
@@ -371,7 +563,10 @@ func (e *Engine) applyTokenUsage(orgID, month string, used int64) []ports.MeterE
 	defer e.mu.Unlock()
 
 	st := e.stateLocked(orgID)
-	if st.tokenMonth != month {
+	if st.tokenMonth > month {
+		return nil
+	}
+	if st.tokenMonth < month {
 		st.tokenMonth = month
 		st.tokenLevel = 0
 	}
@@ -419,14 +614,64 @@ func thresholdLevel(used, limit int64) int {
 	if limit <= 0 || used <= 0 {
 		return 0
 	}
-	pct := used * 100 / limit
 	level := 0
 	for _, t := range ports.MeterThresholds {
-		if pct >= int64(t) {
+		if atLeastPercentage(used, limit, int64(t)) {
 			level++
 		}
 	}
 	return level
+}
+
+func sumAtLeastLimit(a, b, limit int64) bool {
+	if limit <= 0 || a >= limit || b >= limit {
+		return true
+	}
+	if a < 0 {
+		a = 0
+	}
+	if b < 0 {
+		b = 0
+	}
+	return b >= limit-a
+}
+
+func saturatingAddNonNegative(a, b int64) int64 {
+	if a < 0 {
+		a = 0
+	}
+	if b < 0 {
+		b = 0
+	}
+	if b > int64(^uint64(0)>>1)-a {
+		return int64(^uint64(0) >> 1)
+	}
+	return a + b
+}
+
+func atLeastPercentage(used, total, pct int64) bool {
+	if used <= 0 || total <= 0 || pct <= 0 {
+		return false
+	}
+	if used >= total || pct >= 100 {
+		return used >= total
+	}
+	whole := total / 100
+	remainder := total % 100
+	threshold := whole*pct + (remainder*pct+99)/100
+	return used >= threshold
+}
+
+func percentage(used, total int64) int64 {
+	if used <= 0 || total <= 0 {
+		return 0
+	}
+	if used >= total {
+		return 100
+	}
+	hi, lo := bits.Mul64(uint64(used), 100)
+	pct, _ := bits.Div64(hi, lo, uint64(total))
+	return int64(pct)
 }
 
 func (e *Engine) emit(events []ports.MeterEvent) {
