@@ -69,6 +69,8 @@ func TestLoadFrom(t *testing.T) {
 			"OPENROUTER_API_KEY", "OPENAI_API_KEY", "TAVILY_API_KEY",
 			"PROTEAN_SANDBOX_IMAGE", "PROTEAN_SANDBOX_EXEC_TIMEOUT", "PROTEAN_SANDBOX_IDLE_TIMEOUT",
 			"PROTEAN_SANDBOX_MAX_RUNNING", "PROTEAN_SANDBOX_OUTPUT_CAP_BYTES", "PROTEAN_SANDBOX_REAP_INTERVAL",
+			"PROTEAN_LLM_PROVIDER", "PROTEAN_LLM_MODEL", "PROTEAN_LLM_BASE_URL",
+			"PROTEAN_HARNESS_MAX_TURNS", "OPENROUTER_SITE_URL", "OPENROUTER_SITE_NAME",
 		} {
 			t.Setenv(k, "")
 			os.Unsetenv(k)
@@ -120,6 +122,131 @@ func TestLoadFrom(t *testing.T) {
 		}
 		if cfg.SandboxOutputCapBytes != DefaultSandboxOutputCapBytes {
 			t.Errorf("SandboxOutputCapBytes = %d, want %d", cfg.SandboxOutputCapBytes, DefaultSandboxOutputCapBytes)
+		}
+		if cfg.LLMProvider != DefaultLLMProvider {
+			t.Errorf("LLMProvider = %q, want %q", cfg.LLMProvider, DefaultLLMProvider)
+		}
+		if cfg.LLMModel != DefaultLLMModel {
+			t.Errorf("LLMModel = %q, want %q", cfg.LLMModel, DefaultLLMModel)
+		}
+		if cfg.LLMBaseURL != OpenRouterBaseURL {
+			t.Errorf("LLMBaseURL = %q, want %q", cfg.LLMBaseURL, OpenRouterBaseURL)
+		}
+		if cfg.HarnessMaxTurns != DefaultHarnessMaxTurns {
+			t.Errorf("HarnessMaxTurns = %d, want %d", cfg.HarnessMaxTurns, DefaultHarnessMaxTurns)
+		}
+	})
+
+	t.Run("the base url follows the provider", func(t *testing.T) {
+		clearEnv(t)
+		t.Setenv("PROTEAN_LLM_PROVIDER", ProviderOpenAI)
+		t.Setenv("PROTEAN_LLM_MODEL", "gpt-5.2")
+		cfg, err := LoadFrom("")
+		if err != nil {
+			t.Fatalf("LoadFrom: %v", err)
+		}
+		if cfg.LLMBaseURL != OpenAIBaseURL {
+			t.Errorf("LLMBaseURL = %q, want %q", cfg.LLMBaseURL, OpenAIBaseURL)
+		}
+	})
+
+	t.Run("a non-default provider must name its model", func(t *testing.T) {
+		// The default model is an OpenRouter slug. Accepting it for OpenAI
+		// would boot clean and 404 on the first invocation.
+		clearEnv(t)
+		t.Setenv("PROTEAN_LLM_PROVIDER", ProviderOpenAI)
+		if _, err := LoadFrom(""); err == nil {
+			t.Fatal("want an error when the openai provider has no model")
+		}
+	})
+
+	t.Run("llm overrides", func(t *testing.T) {
+		clearEnv(t)
+		path := writeEnv(t, strings.Join([]string{
+			"PROTEAN_LLM_PROVIDER=openai",
+			"PROTEAN_LLM_MODEL=gpt-5.2",
+			"PROTEAN_LLM_BASE_URL=http://localhost:11434/v1/",
+			"PROTEAN_HARNESS_MAX_TURNS=12",
+			"OPENROUTER_SITE_URL=https://protean.test",
+			"OPENROUTER_SITE_NAME=Protean",
+			"",
+		}, "\n"))
+		cfg, err := LoadFrom(path)
+		if err != nil {
+			t.Fatalf("LoadFrom: %v", err)
+		}
+		if cfg.LLMProvider != ProviderOpenAI {
+			t.Errorf("LLMProvider = %q", cfg.LLMProvider)
+		}
+		if cfg.LLMModel != "gpt-5.2" {
+			t.Errorf("LLMModel = %q", cfg.LLMModel)
+		}
+		if cfg.LLMBaseURL != "http://localhost:11434/v1" {
+			t.Errorf("LLMBaseURL = %q, want the trailing slash removed", cfg.LLMBaseURL)
+		}
+		if cfg.HarnessMaxTurns != 12 {
+			t.Errorf("HarnessMaxTurns = %d", cfg.HarnessMaxTurns)
+		}
+		if cfg.OpenRouterSiteURL != "https://protean.test" || cfg.OpenRouterSiteName != "Protean" {
+			t.Errorf("attribution = %q / %q", cfg.OpenRouterSiteURL, cfg.OpenRouterSiteName)
+		}
+	})
+
+	t.Run("invalid llm values", func(t *testing.T) {
+		for _, tc := range []struct{ key, value string }{
+			{"PROTEAN_LLM_PROVIDER", "anthropic"},
+			{"PROTEAN_HARNESS_MAX_TURNS", "lots"},
+			{"PROTEAN_HARNESS_MAX_TURNS", "0"},
+			{"PROTEAN_HARNESS_MAX_TURNS", "501"},
+		} {
+			t.Run(tc.key+"="+tc.value, func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv(tc.key, tc.value)
+				if _, err := LoadFrom(""); err == nil {
+					t.Fatalf("want error for %s=%s", tc.key, tc.value)
+				}
+			})
+		}
+	})
+
+	t.Run("provider key resolution", func(t *testing.T) {
+		tests := []struct {
+			provider string
+			wantKey  string
+			wantEnv  string
+		}{
+			{ProviderOpenRouter, "or-key", "OPENROUTER_API_KEY"},
+			{ProviderOpenAI, "oai-key", "OPENAI_API_KEY"},
+		}
+		for _, tc := range tests {
+			t.Run(tc.provider, func(t *testing.T) {
+				clearEnv(t)
+				t.Setenv("PROTEAN_LLM_PROVIDER", tc.provider)
+				t.Setenv("PROTEAN_LLM_MODEL", "some/model")
+				t.Setenv("OPENROUTER_API_KEY", "or-key")
+				t.Setenv("OPENAI_API_KEY", "oai-key")
+				cfg, err := LoadFrom("")
+				if err != nil {
+					t.Fatalf("LoadFrom: %v", err)
+				}
+				if got := cfg.LLMAPIKey(); got != tc.wantKey {
+					t.Errorf("LLMAPIKey() = %q, want %q", got, tc.wantKey)
+				}
+				if got := cfg.LLMAPIKeyEnv(); got != tc.wantEnv {
+					t.Errorf("LLMAPIKeyEnv() = %q, want %q", got, tc.wantEnv)
+				}
+			})
+		}
+	})
+
+	t.Run("a missing provider key is not an error", func(t *testing.T) {
+		clearEnv(t)
+		cfg, err := LoadFrom("")
+		if err != nil {
+			t.Fatalf("LoadFrom: %v", err)
+		}
+		if cfg.LLMAPIKey() != "" {
+			t.Errorf("LLMAPIKey() = %q, want empty", cfg.LLMAPIKey())
 		}
 	})
 

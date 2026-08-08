@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -43,6 +44,39 @@ const (
 	// MaxSandboxExecTimeout is the hard ceiling on a single sandbox command.
 	// Configuring more than this is a configuration error, not a clamp.
 	MaxSandboxExecTimeout = 10 * time.Minute
+
+	// LLM provider defaults (S5/D4). OpenRouter is the default provider and
+	// OpenAI the secondary; both speak the same API, so they differ only by
+	// base URL, key, and model.
+	DefaultLLMProvider = ProviderOpenRouter
+
+	// DefaultLLMModel is an OpenRouter model slug, so it only applies to
+	// OpenRouter: choosing another provider means naming its model too.
+	DefaultLLMModel = "xiaomi/mimo-v2.5-pro"
+
+	// DefaultHarnessMaxTurns bounds one agent run. It is the runaway guard;
+	// the token budget is the entitlements engine's business. It must stay in
+	// step with harness.DefaultMaxTurns, which applies when the harness is
+	// built without this setting.
+	DefaultHarnessMaxTurns = 40
+
+	// MaxHarnessMaxTurns is the ceiling on the runaway guard.
+	MaxHarnessMaxTurns = 500
+)
+
+// Supported LLM provider names for PROTEAN_LLM_PROVIDER.
+const (
+	ProviderOpenRouter = "openrouter"
+	ProviderOpenAI     = "openai"
+)
+
+// Base URLs used when PROTEAN_LLM_BASE_URL does not override them. The
+// provider mapping lives here rather than in the adapter, because the adapter
+// is not "OpenRouter" or "OpenAI" — it is whatever OpenAI-compatible endpoint
+// it is pointed at.
+const (
+	OpenRouterBaseURL = "https://openrouter.ai/api/v1"
+	OpenAIBaseURL     = "https://api.openai.com/v1"
 )
 
 type Config struct {
@@ -63,9 +97,42 @@ type Config struct {
 	SandboxMaxRunning     int
 	SandboxOutputCapBytes int
 	SandboxReapInterval   time.Duration
+
+	// LLMProvider selects which key and which base URL the harness uses.
+	LLMProvider string
+	LLMModel    string
+	LLMBaseURL  string
+
+	// OpenRouterSiteURL and OpenRouterSiteName are OpenRouter's optional
+	// attribution headers. They are only sent when set.
+	OpenRouterSiteURL  string
+	OpenRouterSiteName string
+
+	HarnessMaxTurns int
 }
 
 func (c Config) Addr() string { return fmt.Sprintf(":%d", c.APIPort) }
+
+// LLMAPIKey is the key for the selected provider. It is empty when the
+// provider is not configured, which is not a boot failure: the process serves
+// fine without an agent, it just cannot invoke one.
+func (c Config) LLMAPIKey() string {
+	switch c.LLMProvider {
+	case ProviderOpenAI:
+		return c.OpenAIAPIKey
+	default:
+		return c.OpenRouterAPIKey
+	}
+}
+
+// LLMAPIKeyEnv names the variable LLMAPIKey reads, so an operator can be told
+// exactly what to set.
+func (c Config) LLMAPIKeyEnv() string {
+	if c.LLMProvider == ProviderOpenAI {
+		return "OPENAI_API_KEY"
+	}
+	return "OPENROUTER_API_KEY"
+}
 
 // Load reads DefaultEnvFile (if present) and then the environment.
 func Load() (Config, error) { return LoadFrom(DefaultEnvFile) }
@@ -94,6 +161,11 @@ func LoadFrom(envFile string) (Config, error) {
 		SandboxMaxRunning:         DefaultSandboxMaxRunning,
 		SandboxOutputCapBytes:     DefaultSandboxOutputCapBytes,
 		SandboxReapInterval:       DefaultSandboxReapInterval,
+		LLMProvider:               DefaultLLMProvider,
+		LLMModel:                  DefaultLLMModel,
+		OpenRouterSiteURL:         os.Getenv("OPENROUTER_SITE_URL"),
+		OpenRouterSiteName:        os.Getenv("OPENROUTER_SITE_NAME"),
+		HarnessMaxTurns:           DefaultHarnessMaxTurns,
 	}
 
 	if v := os.Getenv("PROTEAN_API_PORT"); v != "" {
@@ -165,12 +237,43 @@ func LoadFrom(envFile string) (Config, error) {
 		return Config{}, err
 	}
 
+	if v := os.Getenv("PROTEAN_LLM_PROVIDER"); v != "" {
+		switch v {
+		case ProviderOpenRouter, ProviderOpenAI:
+			cfg.LLMProvider = v
+		default:
+			return Config{}, fmt.Errorf("PROTEAN_LLM_PROVIDER %q must be %q or %q", v, ProviderOpenRouter, ProviderOpenAI)
+		}
+	}
+	if v := os.Getenv("PROTEAN_LLM_MODEL"); v != "" {
+		cfg.LLMModel = v
+	} else if cfg.LLMProvider != ProviderOpenRouter {
+		// The default model is an OpenRouter slug. Letting it stand for
+		// another provider would boot cleanly and then fail on the first
+		// invocation with a model-not-found nobody expected.
+		return Config{}, fmt.Errorf("PROTEAN_LLM_MODEL must be set when PROTEAN_LLM_PROVIDER is %q", cfg.LLMProvider)
+	}
+	cfg.LLMBaseURL = defaultLLMBaseURL(cfg.LLMProvider)
+	if v := os.Getenv("PROTEAN_LLM_BASE_URL"); v != "" {
+		cfg.LLMBaseURL = strings.TrimRight(v, "/")
+	}
+	if err := envInt("PROTEAN_HARNESS_MAX_TURNS", &cfg.HarnessMaxTurns, 1, MaxHarnessMaxTurns); err != nil {
+		return Config{}, err
+	}
+
 	cfg.SQLiteDBPath = filepath.Join(cfg.DataDir, DefaultSQLiteDBFile)
 	if v := os.Getenv("PROTEAN_SQLITE_DB_PATH"); v != "" {
 		cfg.SQLiteDBPath = filepath.Clean(v)
 	}
 
 	return cfg, nil
+}
+
+func defaultLLMBaseURL(provider string) string {
+	if provider == ProviderOpenAI {
+		return OpenAIBaseURL
+	}
+	return OpenRouterBaseURL
 }
 
 // envDuration overwrites dst with the positive duration in key, leaving dst
