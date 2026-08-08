@@ -112,8 +112,8 @@ func TestEnsureCreatesAndStartsContainer(t *testing.T) {
 	if got := call.config.WorkingDir; got != sandbox.WorkspaceRoot {
 		t.Errorf("working dir = %q, want %q", got, sandbox.WorkspaceRoot)
 	}
-	if call.config.User != "" {
-		t.Errorf("User = %q, want empty so the image's non-root user applies", call.config.User)
+	if call.config.User != sandboxUser {
+		t.Errorf("User = %q, want explicit non-root %q", call.config.User, sandboxUser)
 	}
 
 	// Labels keep the container discoverable after a backend restart.
@@ -147,6 +147,9 @@ func TestEnsureCreatesAndStartsContainer(t *testing.T) {
 	}
 	if call.host.AutoRemove {
 		t.Error("AutoRemove = true, want false: this runtime owns the lifecycle")
+	}
+	if call.host.Init == nil || !*call.host.Init {
+		t.Error("Init is not enabled: orphaned exec descendants would not be reaped")
 	}
 	if len(call.host.PortBindings) != 0 {
 		t.Errorf("PortBindings = %v, want none", call.host.PortBindings)
@@ -222,14 +225,19 @@ func TestEnsureMountsWorkspaceMaskAndAgentsFile(t *testing.T) {
 
 func TestEnsureReusesRunningContainer(t *testing.T) {
 	h := newHarness(t, nil)
-	h.api.setContainer(ContainerName(testRef), "existing-id", true)
+	first, err := h.rt.Ensure(context.Background(), testRef)
+	if err != nil {
+		t.Fatalf("first Ensure: %v", err)
+	}
+	h.api.creates = nil
+	h.api.started = nil
 
 	sb, err := h.rt.Ensure(context.Background(), testRef)
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-	if got := sb.(*sandboxHandle).containerID; got != "existing-id" {
-		t.Errorf("container id = %q, want existing-id", got)
+	if got, want := sb.(*sandboxHandle).containerID, first.(*sandboxHandle).containerID; got != want {
+		t.Errorf("container id = %q, want %q", got, want)
 	}
 	if len(h.api.creates) != 0 {
 		t.Errorf("created %d containers, want 0", len(h.api.creates))
@@ -244,7 +252,17 @@ func TestEnsureReusesRunningContainer(t *testing.T) {
 
 func TestEnsureStartsStoppedContainer(t *testing.T) {
 	h := newHarness(t, nil)
-	h.api.setContainer(ContainerName(testRef), "existing-id", false)
+	first, err := h.rt.Ensure(context.Background(), testRef)
+	if err != nil {
+		t.Fatalf("first Ensure: %v", err)
+	}
+	id := first.(*sandboxHandle).containerID
+	if err := h.api.ContainerStop(context.Background(), id, container.StopOptions{}); err != nil {
+		t.Fatalf("seed stopped container: %v", err)
+	}
+	h.rt.releaseSlot(h.rt.stateFor(testRef))
+	h.api.creates = nil
+	h.api.started = nil
 
 	if _, err := h.rt.Ensure(context.Background(), testRef); err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -252,8 +270,95 @@ func TestEnsureStartsStoppedContainer(t *testing.T) {
 	if len(h.api.creates) != 0 {
 		t.Errorf("created %d containers, want 0", len(h.api.creates))
 	}
-	if !slices.Contains(h.api.snapshotStarted(), "existing-id") {
-		t.Errorf("started = %v, want it to contain existing-id", h.api.snapshotStarted())
+	if !slices.Contains(h.api.snapshotStarted(), id) {
+		t.Errorf("started = %v, want it to contain %s", h.api.snapshotStarted(), id)
+	}
+}
+
+func TestEnsureReplacesContainersWithInvalidSecurityConfiguration(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*container.InspectResponse)
+	}{
+		{"name", func(insp *container.InspectResponse) { insp.Name = "/colliding-container" }},
+		{"labels", func(insp *container.InspectResponse) { insp.Config.Labels[LabelProject] = "OTHER" }},
+		{"image reference", func(insp *container.InspectResponse) { insp.Config.Image = "attacker:latest" }},
+		{"image id", func(insp *container.InspectResponse) { insp.Image = "sha256:stale" }},
+		{"user", func(insp *container.InspectResponse) { insp.Config.User = "0" }},
+		{"mount source", func(insp *container.InspectResponse) { insp.HostConfig.Mounts[0].Source = "/" }},
+		{"mount readonly", func(insp *container.InspectResponse) { insp.HostConfig.Mounts[1].ReadOnly = false }},
+		{"extra mount", func(insp *container.InspectResponse) {
+			insp.HostConfig.Mounts = append(insp.HostConfig.Mounts, insp.HostConfig.Mounts[0])
+		}},
+		{"network", func(insp *container.InspectResponse) { insp.HostConfig.NetworkMode = "bridge" }},
+		{"resources", func(insp *container.InspectResponse) { insp.HostConfig.Memory = 0 }},
+		{"restart", func(insp *container.InspectResponse) { insp.HostConfig.RestartPolicy.Name = "always" }},
+		{"init", func(insp *container.InspectResponse) { disabled := false; insp.HostConfig.Init = &disabled }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			first, err := h.rt.Ensure(context.Background(), testRef)
+			if err != nil {
+				t.Fatalf("first Ensure: %v", err)
+			}
+			oldID := first.(*sandboxHandle).containerID
+			insp := h.api.containers[ContainerName(testRef)]
+			tc.mutate(&insp)
+			h.api.containers[ContainerName(testRef)] = insp
+			h.api.creates = nil
+			h.api.removed = nil
+
+			if _, err := h.rt.Ensure(context.Background(), testRef); err != nil {
+				t.Fatalf("Ensure after mutation: %v", err)
+			}
+			if !slices.Contains(h.api.removed, oldID) {
+				t.Errorf("removed = %v, want invalid container %s destroyed", h.api.removed, oldID)
+			}
+			if len(h.api.creates) != 1 {
+				t.Errorf("creates = %d, want one canonical replacement", len(h.api.creates))
+			}
+		})
+	}
+}
+
+func TestPrepareHostReplacesAgentsSymlink(t *testing.T) {
+	tests := []struct {
+		name   string
+		target func(*testing.T, *harness) string
+	}{
+		{"outside project", func(t *testing.T, h *harness) string {
+			path := filepath.Join(t.TempDir(), "other-agents.md")
+			if err := os.WriteFile(path, []byte("other project"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		}},
+		{"system file", func(*testing.T, *harness) string { return "/etc/passwd" }},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			project := h.rt.ProjectDir(testRef)
+			if err := os.MkdirAll(project, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			agents := filepath.Join(project, sandbox.AgentsFileName)
+			if err := os.Symlink(tc.target(t, h), agents); err != nil {
+				t.Fatal(err)
+			}
+			layout, err := h.rt.prepareHost(testRef)
+			if err != nil {
+				t.Fatalf("prepareHost: %v", err)
+			}
+			info, err := os.Lstat(layout.agentsFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				t.Errorf("AGENTS.md remains a symlink: %s", layout.agentsFile)
+			}
+		})
 	}
 }
 
@@ -270,6 +375,31 @@ func TestEnsureMissingImageTellsOperatorHowToFixIt(t *testing.T) {
 	}
 	if len(h.api.creates) != 0 {
 		t.Error("a container was created despite the missing image")
+	}
+}
+
+func TestFactoryAvailableRejectsUnusableImages(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*fakeDocker)
+		want   string
+	}{
+		{"missing", func(api *fakeDocker) { api.imageMissing = true }, "make sandbox-image"},
+		{"empty user", func(api *fakeDocker) { api.imageUser = "" }, "root or invalid USER"},
+		{"root user", func(api *fakeDocker) { api.imageUser = "0" }, "root or invalid USER"},
+		{"probe failure", func(api *fakeDocker) { api.healthExit = 1 }, "/usr/bin/timeout"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			api := newFakeDocker()
+			tc.mutate(api)
+			factory := NewFactory(Options{Image: "protean-sandbox:test", Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+			factory.api = api
+			err := factory.Available(context.Background())
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Available error = %v, want it to contain %q", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -291,22 +421,63 @@ func TestEnsureRejectsUnusableRefs(t *testing.T) {
 
 func TestAdoptsRunningContainersOnBoot(t *testing.T) {
 	api := newFakeDocker()
+	dataDir := t.TempDir()
+	opts := Options{DataDir: dataDir, MaxRunning: 2, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	seed, err := New(context.Background(), api, opts)
+	if err != nil {
+		t.Fatalf("seed runtime: %v", err)
+	}
+	refs := []ports.ProjectRef{{OrgID: "01ORG", ProjectID: "01A"}, {OrgID: "01ORG", ProjectID: "01B"}}
+	for _, ref := range refs {
+		if _, err := seed.Ensure(context.Background(), ref); err != nil {
+			t.Fatalf("seed %v: %v", ref, err)
+		}
+	}
 	api.list = []container.Summary{
-		{ID: "id-a", Labels: map[string]string{LabelManaged: "true", LabelOrg: "01ORG", LabelProject: "01A"}},
-		{ID: "id-b", Labels: map[string]string{LabelManaged: "true", LabelOrg: "01ORG", LabelProject: "01B"}},
+		{ID: seed.stateFor(refs[0]).containerID, Labels: map[string]string{LabelManaged: "true", LabelOrg: "01ORG", LabelProject: "01A"}},
+		{ID: seed.stateFor(refs[1]).containerID, Labels: map[string]string{LabelManaged: "true", LabelOrg: "01ORG", LabelProject: "01B"}},
 		{ID: "id-bad", Labels: map[string]string{LabelManaged: "true"}},
 	}
 
-	rt, err := New(context.Background(), api, Options{
-		DataDir:    t.TempDir(),
-		MaxRunning: 2,
-		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-	})
+	rt, err := New(context.Background(), api, opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
 	if got := rt.slots.inUse(); got != 2 {
 		t.Errorf("slots in use = %d, want 2 (the unlabelled container is ignored)", got)
+	}
+}
+
+func TestAdoptionReplacesInvalidRunningContainer(t *testing.T) {
+	api := newFakeDocker()
+	opts := Options{DataDir: t.TempDir(), MaxRunning: 1, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	seed, err := New(context.Background(), api, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb, err := seed.Ensure(context.Background(), testRef)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldID := sb.(*sandboxHandle).containerID
+	insp := api.containers[ContainerName(testRef)]
+	insp.HostConfig.Mounts[0].Source = "/"
+	api.containers[ContainerName(testRef)] = insp
+	api.list = []container.Summary{{ID: oldID, Labels: map[string]string{
+		LabelManaged: "true", LabelOrg: testRef.OrgID, LabelProject: testRef.ProjectID,
+	}}}
+	api.creates = nil
+	api.removed = nil
+
+	rt, err := New(context.Background(), api, opts)
+	if err != nil {
+		t.Fatalf("restart New: %v", err)
+	}
+	if !slices.Contains(api.removed, oldID) || len(api.creates) != 1 {
+		t.Fatalf("adoption removed=%v creates=%d, want invalid container replaced", api.removed, len(api.creates))
+	}
+	if got := rt.slots.inUse(); got != 1 {
+		t.Errorf("slots in use = %d, want replacement adopted once", got)
 	}
 }
 
@@ -421,6 +592,29 @@ func TestReaperStopsIdleSandboxesOnly(t *testing.T) {
 	}
 }
 
+func TestReaperDoesNotStopActiveOperationAndCompletionRefreshesActivity(t *testing.T) {
+	h := newHarness(t, func(o *Options) { o.IdleTimeout = time.Minute })
+	_, finish, err := h.rt.beginOperation(context.Background(), testRef)
+	if err != nil {
+		t.Fatalf("begin operation: %v", err)
+	}
+	h.clock.advance(2 * time.Minute)
+	h.rt.reap(context.Background())
+	if slices.Contains(h.api.snapshotStopped(), ContainerName(testRef)) {
+		t.Fatal("reaper stopped a sandbox with an active operation")
+	}
+	finish()
+	h.rt.reap(context.Background())
+	if slices.Contains(h.api.snapshotStopped(), ContainerName(testRef)) {
+		t.Fatal("reaper ignored the completion activity stamp")
+	}
+	h.clock.advance(2 * time.Minute)
+	h.rt.reap(context.Background())
+	if !slices.Contains(h.api.snapshotStopped(), ContainerName(testRef)) {
+		t.Fatal("sandbox was not reaped after becoming idle")
+	}
+}
+
 func TestExecPlumbing(t *testing.T) {
 	h := newHarness(t, nil)
 	h.api.script(execScript{stdout: []byte("hello\n"), stderr: []byte("warn\n"), exitCode: 3})
@@ -455,15 +649,14 @@ func TestExecPlumbing(t *testing.T) {
 		t.Fatalf("execs = %d, want 1", len(execs))
 	}
 	opts := execs[0].opts
-	want := []string{"timeout", "--kill-after=5s", "45s", "/bin/sh", "-lc", "echo hello"}
-	if !slices.Equal(opts.Cmd, want) {
-		t.Errorf("Cmd = %q, want %q", opts.Cmd, want)
+	if len(opts.Cmd) != 8 || opts.Cmd[0] != "/usr/bin/timeout" || opts.Cmd[2] != "45s" || opts.Cmd[7] != "echo hello" {
+		t.Errorf("Cmd = %q, want absolute timeout and the original command", opts.Cmd)
 	}
 	if opts.WorkingDir != "/workspace/src" {
 		t.Errorf("WorkingDir = %q, want /workspace/src", opts.WorkingDir)
 	}
-	if !slices.Equal(opts.Env, []string{"FOO=bar"}) {
-		t.Errorf("Env = %q, want [FOO=bar]", opts.Env)
+	if !slices.Equal(opts.Env, []string{"FOO=bar", "PATH=/usr/local/bin:/usr/bin:/bin"}) {
+		t.Errorf("Env = %q, want caller value plus canonical PATH", opts.Env)
 	}
 	if !opts.AttachStdout || !opts.AttachStderr {
 		t.Error("stdout/stderr are not attached")
@@ -471,8 +664,24 @@ func TestExecPlumbing(t *testing.T) {
 	if opts.Privileged || opts.Tty {
 		t.Errorf("Privileged = %v, Tty = %v, want both false", opts.Privileged, opts.Tty)
 	}
-	if opts.User != "" {
-		t.Errorf("User = %q, want empty so the image's non-root user applies", opts.User)
+}
+
+func TestExecSanitizesSupervisorEnvironment(t *testing.T) {
+	h := newHarness(t, nil)
+	h.api.script(execScript{})
+	sb, err := h.rt.Ensure(context.Background(), testRef)
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	_, err = sb.Exec(context.Background(), ports.ExecSpec{Command: "true", Env: []string{
+		"PATH=/workspace", "LD_PRELOAD=/workspace/evil.so", "BASH_ENV=/workspace/evil", "SAFE=value",
+	}})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	want := []string{"SAFE=value", "PATH=/usr/local/bin:/usr/bin:/bin"}
+	if got := h.api.snapshotExecs()[0].opts.Env; !slices.Equal(got, want) {
+		t.Errorf("Env = %q, want %q", got, want)
 	}
 }
 
@@ -596,10 +805,9 @@ func TestFileOpsRejectUnsafePaths(t *testing.T) {
 	}
 }
 
-func TestWriteFileArchive(t *testing.T) {
+func TestWriteFileUsesAnchoredExec(t *testing.T) {
 	h := newHarness(t, nil)
-	// The first exec resolves the container user, so script its output.
-	h.api.script(execScript{stdout: []byte("10001\n10001\n")})
+	h.api.script(execScript{})
 
 	sb, err := h.rt.Ensure(context.Background(), testRef)
 	if err != nil {
@@ -609,48 +817,20 @@ func TestWriteFileArchive(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	if len(h.api.copiedTo) != 1 {
-		t.Fatalf("copies = %d, want 1", len(h.api.copiedTo))
+	if len(h.api.copiedTo) != 0 {
+		t.Fatalf("copies = %d, want 0: Docker tar extraction is symlink-raceable", len(h.api.copiedTo))
 	}
-	call := h.api.copiedTo[0]
-	if call.dstPath != sandbox.WorkspaceRoot {
-		t.Errorf("dst = %q, want %q", call.dstPath, sandbox.WorkspaceRoot)
+	execs := h.api.snapshotExecs()
+	if len(execs) != 1 {
+		t.Fatalf("execs = %d, want 1", len(execs))
 	}
-	if !call.opts.CopyUIDGID {
-		t.Error("CopyUIDGID = false: files would land owned by root, not the sandbox user")
+	if !execs[0].opts.AttachStdin {
+		t.Error("secure writer did not attach stdin")
 	}
-
-	var names []string
-	tr := tar.NewReader(bytes.NewReader(call.content))
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatalf("read archive: %v", err)
-		}
-		names = append(names, hdr.Name)
-		if hdr.Uid != 10001 || hdr.Gid != 10001 {
-			t.Errorf("%s owned by %d:%d, want 10001:10001", hdr.Name, hdr.Uid, hdr.Gid)
-		}
-		if hdr.Typeflag == tar.TypeReg {
-			if hdr.Mode != 0o600 {
-				t.Errorf("%s mode = %o, want 600", hdr.Name, hdr.Mode)
-			}
-			body, err := io.ReadAll(tr)
-			if err != nil {
-				t.Fatalf("read entry: %v", err)
-			}
-			if string(body) != "package main" {
-				t.Errorf("body = %q, want %q", body, "package main")
-			}
-		}
-	}
-	// Parent directories travel with the file so a single copy creates them.
-	want := []string{"src/", "src/pkg/", "src/pkg/main.go"}
-	if !slices.Equal(names, want) {
-		t.Errorf("archive entries = %q, want %q", names, want)
+	command := execs[0].opts.Cmd[6]
+	if !strings.Contains(command, `actual=$(/usr/bin/readlink -f /proc/self/fd/3)`) ||
+		!strings.Contains(command, `[ "$actual" = "$parent" ]`) || !strings.Contains(command, "/bin/mv -fT") {
+		t.Errorf("secure writer command does not anchor and verify the parent directory: %q", command)
 	}
 }
 
@@ -689,8 +869,8 @@ func TestDeleteFile(t *testing.T) {
 		t.Fatalf("DeleteFile: %v", err)
 	}
 	cmd := h.api.snapshotExecs()[0].opts.Cmd
-	if !strings.Contains(cmd[5], "rm -rf -- '/workspace/src/old.go'") {
-		t.Errorf("delete command = %q, does not remove the resolved path", cmd[5])
+	if !strings.Contains(cmd[7], "rm -rf -- '/workspace/src/old.go'") {
+		t.Errorf("delete command = %q, does not remove the resolved path", cmd[7])
 	}
 
 	h.api.script(execScript{exitCode: missingPathExit})

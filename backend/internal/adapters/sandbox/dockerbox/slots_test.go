@@ -91,6 +91,41 @@ func TestSlotsAdoptMayExceedTheCap(t *testing.T) {
 	}
 }
 
+func TestSlotsReleaseAboveCapDoesNotWakeQueuedWaiter(t *testing.T) {
+	s := newSlots(1)
+	s.adopt()
+	s.adopt()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	acquired := make(chan error, 1)
+	go func() { acquired <- s.acquire(ctx) }()
+	time.Sleep(20 * time.Millisecond)
+
+	s.release()
+	if got := s.inUse(); got != 1 {
+		t.Fatalf("in use after above-cap release = %d, want 1", got)
+	}
+	select {
+	case err := <-acquired:
+		t.Fatalf("queued waiter woke while the adopted sandbox still filled the cap: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	s.release()
+	select {
+	case err := <-acquired:
+		if err != nil {
+			t.Fatalf("waiter acquire: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued waiter was not handed the newly free slot")
+	}
+	if got := s.inUse(); got != 1 {
+		t.Errorf("in use after handoff = %d, want 1", got)
+	}
+}
+
 func TestSlotsConcurrentUseNeverExceedsTheCap(t *testing.T) {
 	const limit = 3
 	s := newSlots(limit)

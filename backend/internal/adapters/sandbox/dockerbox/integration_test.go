@@ -3,6 +3,7 @@ package dockerbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -83,6 +84,9 @@ func newIntegration(t *testing.T, mutate func(*Options)) *integrationEnvT {
 		ProjectID: strings.ToUpper(strings.ReplaceAll(t.Name(), "/", "")) + "-" + time.Now().Format("150405.000"),
 	}
 	ref.ProjectID = strings.ReplaceAll(ref.ProjectID, ".", "")
+	if len(ref.ProjectID) > 64 {
+		ref.ProjectID = ref.ProjectID[:64]
+	}
 
 	env := &integrationEnvT{rt: rt, api: api, ref: ref, dir: dir}
 	// Teardown runs even when the test fails, so no container is left behind.
@@ -93,6 +97,20 @@ func newIntegration(t *testing.T, mutate func(*Options)) *integrationEnvT {
 			t.Logf("teardown: destroy %s: %v", ContainerName(ref), err)
 		}
 		_ = rt.Close()
+		// Docker Desktop can release bind mounts just after ContainerRemove
+		// returns. Remove the temporary data root with a short retry so
+		// testing.TempDir cleanup does not race that unmount.
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			err := os.RemoveAll(dir)
+			if err == nil || time.Now().After(deadline) {
+				if err != nil {
+					t.Logf("teardown: remove temporary data root: %v", err)
+				}
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
 	})
 	return env
 }
@@ -262,6 +280,152 @@ func TestIntegrationAgentsFileIsReadOnly(t *testing.T) {
 	}
 }
 
+func TestIntegrationAgentsSymlinkCannotEscapeProject(t *testing.T) {
+	tests := []struct {
+		name   string
+		target func(*testing.T, *integrationEnvT) string
+	}{
+		{"etc passwd", func(*testing.T, *integrationEnvT) string { return "/etc/passwd" }},
+		{"other project", func(t *testing.T, env *integrationEnvT) string {
+			other := ports.ProjectRef{OrgID: env.ref.OrgID, ProjectID: env.ref.ProjectID + "OTHER"}
+			path := filepath.Join(env.rt.ProjectDir(other), sandbox.AgentsFileName)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte("other project secret"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := newIntegration(t, nil)
+			project := env.rt.ProjectDir(env.ref)
+			if err := os.MkdirAll(project, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			target := tc.target(t, env)
+			agents := filepath.Join(project, sandbox.AgentsFileName)
+			if err := os.Symlink(target, agents); err != nil {
+				t.Fatal(err)
+			}
+
+			sb := env.ensure(t)
+			res := env.exec(t, sb, ports.ExecSpec{Command: "cat /workspace/AGENTS.md; test ! -L /workspace/AGENTS.md"})
+			if res.ExitCode != 0 || strings.Contains(res.Stdout, "root:") || strings.Contains(res.Stdout, "other project secret") {
+				t.Fatalf("unsafe AGENTS.md source reached the sandbox: exit=%d stdout=%q stderr=%q", res.ExitCode, res.Stdout, res.Stderr)
+			}
+			info, err := os.Lstat(agents)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				t.Fatal("host AGENTS.md symlink was not replaced")
+			}
+		})
+	}
+}
+
+func TestIntegrationControlMaskCoversCaseInsensitiveLookup(t *testing.T) {
+	env := newIntegration(t, nil)
+	project := env.rt.ProjectDir(env.ref)
+	control := filepath.Join(project, sandbox.ControlDirName)
+	if err := os.MkdirAll(control, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(control, "case-secret"), []byte("case-insensitive secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sb := env.ensure(t)
+
+	read := env.exec(t, sb, ports.ExecSpec{Command: "cat /workspace/.PROTEAN/case-secret"})
+	if read.ExitCode == 0 || strings.Contains(read.Stdout, "case-insensitive secret") {
+		t.Fatalf("alternate-case control path bypassed the mask: exit=%d stdout=%q", read.ExitCode, read.Stdout)
+	}
+	write := env.exec(t, sb, ports.ExecSpec{Command: "echo escaped > /workspace/.PROTEAN/case-write"})
+	if write.ExitCode == 0 {
+		t.Fatal("alternate-case control path was writable")
+	}
+}
+
+func TestIntegrationWriteFileResistsSymlinkSwapRace(t *testing.T) {
+	env := newIntegration(t, nil)
+	sb := env.ensure(t)
+	ctx := context.Background()
+	project := env.rt.ProjectDir(env.ref)
+	agents := filepath.Join(project, sandbox.AgentsFileName)
+	if err := os.WriteFile(agents, []byte("agents sentinel"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rootTarget := "/tmp/protean-write-race-" + strings.ToLower(env.ref.ProjectID)
+	loopDone := make(chan ports.ExecResult, 1)
+	loopErr := make(chan error, 1)
+	go func() {
+		res, err := sb.Exec(ctx, ports.ExecSpec{Command: fmt.Sprintf(`
+i=0
+while [ "$i" -lt 3000 ]; do
+  rm -rf /workspace/parent 2>/dev/null
+  mkdir /workspace/parent 2>/dev/null || true
+  rm -rf /workspace/parent 2>/dev/null
+  ln -s /workspace/.protean /workspace/parent 2>/dev/null || true
+  rm -f /workspace/parent 2>/dev/null
+  ln -s /workspace/AGENTS.md /workspace/parent 2>/dev/null || true
+  rm -f /workspace/parent 2>/dev/null
+  ln -s %s /workspace/parent 2>/dev/null || true
+  i=$((i+1))
+done
+`, shellQuote(rootTarget)), Timeout: 30 * time.Second})
+		loopDone <- res
+		loopErr <- err
+	}()
+
+	successes := 0
+	for i := range 20 {
+		err := sb.WriteFile(ctx, "parent/file", []byte(fmt.Sprintf("write-%d", i)), 0o644)
+		if err == nil {
+			successes++
+		}
+	}
+	res := <-loopDone
+	if err := <-loopErr; err != nil {
+		t.Fatalf("symlink swap loop: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Fatalf("symlink swap loop exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+	t.Logf("secure writes completed during race: %d/20", successes)
+
+	if _, err := os.Stat(filepath.Join(controlPath(project), "file")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("write escaped into .protean: %v", err)
+	}
+	if got, err := os.ReadFile(agents); err != nil || string(got) != "agents sentinel" {
+		t.Fatalf("AGENTS.md changed during race: %v, %q", err, got)
+	}
+	root := env.exec(t, sb, ports.ExecSpec{Command: fmt.Sprintf("test ! -e %s/file", shellQuote(rootTarget))})
+	if root.ExitCode != 0 {
+		t.Fatal("write escaped into a rootfs location")
+	}
+}
+
+func controlPath(project string) string { return filepath.Join(project, sandbox.ControlDirName) }
+
+func TestIntegrationHostilePathCannotReplaceTimeoutSupervisor(t *testing.T) {
+	env := newIntegration(t, nil)
+	sb := env.ensure(t)
+	if err := sb.WriteFile(context.Background(), "timeout", []byte("#!/bin/sh\necho hijacked > /workspace/timeout-hijacked\nexec \"$@\"\n"), 0o755); err != nil {
+		t.Fatalf("write hostile timeout: %v", err)
+	}
+	res := env.exec(t, sb, ports.ExecSpec{Command: "sleep 20", Env: []string{"PATH=/workspace"}, Timeout: time.Second})
+	if !res.TimedOut {
+		t.Fatalf("real timeout did not fire: exit=%d stdout=%q stderr=%q", res.ExitCode, res.Stdout, res.Stderr)
+	}
+	marker := env.exec(t, sb, ports.ExecSpec{Command: "test ! -e /workspace/timeout-hijacked"})
+	if marker.ExitCode != 0 {
+		t.Fatal("agent-written timeout was executed")
+	}
+}
+
 func TestIntegrationWorkspaceIsWritableBothWays(t *testing.T) {
 	env := newIntegration(t, nil)
 	sb := env.ensure(t)
@@ -328,6 +492,23 @@ func TestIntegrationExecTimesOut(t *testing.T) {
 		t.Errorf("the command ran for %s, want it killed at about 2s", elapsed)
 	}
 
+	background := env.exec(t, sb, ports.ExecSpec{Command: "nohup sleep 3600 >/dev/null 2>&1 & echo $!"})
+	pid := strings.TrimSpace(background.Stdout)
+	if pid == "" {
+		t.Fatal("background-process probe did not return a pid")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		survived := env.exec(t, sb, ports.ExecSpec{Command: "! pgrep -f '^sleep 3600$' >/dev/null"})
+		if survived.ExitCode == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background process %s survived its leader exit", pid)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
 	// The whole process tree dies, not just the shell.
 	tree := env.exec(t, sb, ports.ExecSpec{Command: "sleep 60 & sleep 60", Timeout: 2 * time.Second})
 	if !tree.TimedOut {
@@ -346,6 +527,7 @@ func TestIntegrationExecTimesOut(t *testing.T) {
 func TestIntegrationExecCapsOutput(t *testing.T) {
 	env := newIntegration(t, func(o *Options) { o.OutputCapBytes = 2048 })
 	sb := env.ensure(t)
+	before := sb.(*sandboxHandle).containerID
 
 	res := env.exec(t, sb, ports.ExecSpec{
 		Command: "head -c 200000 /dev/zero | tr '\\0' 'a'",
@@ -366,9 +548,36 @@ func TestIntegrationExecCapsOutput(t *testing.T) {
 	if len(flood.Stdout) > 2048 {
 		t.Errorf("stdout kept %d bytes from the flood, want at most 2048", len(flood.Stdout))
 	}
+	if afterID := sb.(*sandboxHandle).containerID; afterID == before {
+		t.Errorf("output cutoff did not recreate the sandbox: container id remained %s", afterID)
+	}
 	after := env.exec(t, sb, ports.ExecSpec{Command: "echo ok"})
 	if strings.TrimSpace(after.Stdout) != "ok" {
 		t.Errorf("the sandbox is broken after a flood: %q / %q", after.Stdout, after.Stderr)
+	}
+}
+
+func TestIntegrationExecCancellationRecreatesSandbox(t *testing.T) {
+	env := newIntegration(t, nil)
+	sb := env.ensure(t)
+	before := sb.(*sandboxHandle).containerID
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_, err := sb.Exec(ctx, ports.ExecSpec{Command: "sleep 60", Timeout: 30 * time.Second})
+	if err == nil || !strings.Contains(err.Error(), "sandbox was recreated") {
+		t.Fatalf("cancelled Exec error = %v, want a sandbox-recreated error", err)
+	}
+	after := sb.(*sandboxHandle).containerID
+	if after == before {
+		t.Fatalf("container id remained %s after cancellation", after)
+	}
+	insp, err := env.api.ContainerInspect(context.Background(), after)
+	if err != nil || insp.State == nil || !insp.State.Running {
+		t.Fatalf("replacement sandbox is not running: %v, %+v", err, insp.State)
+	}
+	check := env.exec(t, sb, ports.ExecSpec{Command: "! pgrep -f '^sleep 60$' >/dev/null"})
+	if check.ExitCode != 0 {
+		t.Fatal("cancelled exec process survived sandbox recreation")
 	}
 }
 
@@ -479,6 +688,28 @@ func TestIntegrationIdleReaperStopsSandbox(t *testing.T) {
 	}
 	if got := env.rt.slots.inUse(); got != 0 {
 		t.Errorf("slots in use after reaping = %d, want 0", got)
+	}
+}
+
+func TestIntegrationIdleReaperDoesNotStopActiveExec(t *testing.T) {
+	env := newIntegration(t, func(o *Options) {
+		o.IdleTimeout = 300 * time.Millisecond
+		o.ReapInterval = 50 * time.Millisecond
+	})
+	sb := env.ensure(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	env.rt.Start(ctx)
+	defer func() {
+		cancel()
+		env.rt.Wait()
+	}()
+	res := env.exec(t, sb, ports.ExecSpec{Command: "sleep 1; echo completed", Timeout: 5 * time.Second})
+	if res.ExitCode != 0 || strings.TrimSpace(res.Stdout) != "completed" {
+		t.Fatalf("active exec was interrupted: exit=%d stdout=%q stderr=%q", res.ExitCode, res.Stdout, res.Stderr)
+	}
+	insp, err := env.api.ContainerInspect(context.Background(), ContainerName(env.ref))
+	if err != nil || insp.State == nil || !insp.State.Running {
+		t.Fatalf("sandbox was stopped during or immediately after active exec: %v", err)
 	}
 }
 

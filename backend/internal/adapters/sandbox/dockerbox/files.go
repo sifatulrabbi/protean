@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -12,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/sifatulrabbi/protean/backend/internal/ports"
 	"github.com/sifatulrabbi/protean/backend/internal/sandbox"
@@ -35,33 +36,44 @@ func (s *sandboxHandle) WriteFile(ctx context.Context, name string, data []byte,
 	if err != nil {
 		return fmt.Errorf("sandbox: write file: %w", err)
 	}
-	id, err := s.container(ctx)
+	id, finish, err := s.rt.beginOperation(ctx, s.ref)
 	if err != nil {
 		return err
 	}
-
-	uid, gid, err := s.rt.containerUser(ctx, s)
-	if err != nil {
-		return err
-	}
+	defer finish()
+	s.containerID = id
 
 	perm := mode.Perm()
 	if perm == 0 {
 		perm = 0o644
 	}
 
-	rel := strings.TrimPrefix(abs, sandbox.WorkspaceRoot+"/")
-	archive, err := tarFile(rel, data, perm, uid, gid, s.rt.clock.Now())
-	if err != nil {
-		return err
+	parent := path.Dir(abs)
+	base := path.Base(abs)
+	token := make([]byte, 16)
+	if _, err := rand.Read(token); err != nil {
+		return fmt.Errorf("sandbox: write %q: randomize temporary name: %w", name, err)
 	}
-
-	// Extracting at the workspace root lets the archive's directory entries
-	// create any missing parents in one round trip.
-	err = s.rt.api.CopyToContainer(ctx, id, sandbox.WorkspaceRoot, bytes.NewReader(archive),
-		container.CopyToContainerOptions{CopyUIDGID: true})
+	tmp := ".protean-write-" + hex.EncodeToString(token)
+	command := fmt.Sprintf(`
+parent=%s
+/bin/mkdir -p -- "$parent" || exit 70
+exec 3< "$parent" || exit 71
+actual=$(/usr/bin/readlink -f /proc/self/fd/3) || exit 72
+[ "$actual" = "$parent" ] || exit 73
+tmp=/proc/self/fd/3/%s
+trap '/bin/rm -f -- "$tmp"' EXIT HUP INT TERM
+/bin/cat > "$tmp" || exit 74
+/bin/chmod %04o "$tmp" || exit 75
+/bin/mv -fT -- "$tmp" /proc/self/fd/3/%s || exit 76
+trap - EXIT HUP INT TERM
+`, shellQuote(parent), tmp, perm, shellQuote(base))
+	res, err := s.execInput(ctx, id, command, data, 30*time.Second)
 	if err != nil {
 		return fmt.Errorf("sandbox: write %q: %w", name, err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("sandbox: write %q: secure writer exit %d: %s", name, res.ExitCode, strings.TrimSpace(res.Stderr))
 	}
 	return nil
 }
@@ -72,10 +84,12 @@ func (s *sandboxHandle) ReadFile(ctx context.Context, name string) ([]byte, erro
 	if err != nil {
 		return nil, fmt.Errorf("sandbox: read file: %w", err)
 	}
-	id, err := s.container(ctx)
+	id, finish, err := s.rt.beginOperation(ctx, s.ref)
 	if err != nil {
 		return nil, err
 	}
+	defer finish()
+	s.containerID = id
 
 	rc, _, err := s.rt.api.CopyFromContainer(ctx, id, abs)
 	if err != nil {

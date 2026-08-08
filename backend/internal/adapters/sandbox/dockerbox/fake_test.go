@@ -15,6 +15,7 @@ import (
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
+	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -49,6 +50,8 @@ type fakeDocker struct {
 	mu sync.Mutex
 
 	imageMissing bool
+	imageUser    string
+	healthExit   int
 
 	// containers maps name to its inspect response; a missing key is a 404.
 	containers map[string]container.InspectResponse
@@ -85,6 +88,7 @@ func newFakeDocker() *fakeDocker {
 	return &fakeDocker{
 		containers: map[string]container.InspectResponse{},
 		copyFrom:   map[string][]byte{},
+		imageUser:  "agent",
 	}
 }
 
@@ -140,7 +144,9 @@ func (f *fakeDocker) ImageInspect(_ context.Context, imageID string, _ ...client
 	if f.imageMissing {
 		return image.InspectResponse{}, notFound("image " + imageID)
 	}
-	return image.InspectResponse{ID: "sha256:fake"}, nil
+	return image.InspectResponse{ID: "sha256:fake", Config: &dockerspec.DockerOCIImageConfig{
+		ImageConfig: ocispec.ImageConfig{User: f.imageUser},
+	}}, nil
 }
 
 func (f *fakeDocker) ContainerList(context.Context, container.ListOptions) ([]container.Summary, error) {
@@ -155,6 +161,11 @@ func (f *fakeDocker) ContainerInspect(_ context.Context, id string) (container.I
 	if c, ok := f.containers[id]; ok {
 		return c, nil
 	}
+	for _, c := range f.containers {
+		if c.ID == id {
+			return c, nil
+		}
+	}
 	return container.InspectResponse{}, notFound("container " + id)
 }
 
@@ -166,12 +177,18 @@ func (f *fakeDocker) ContainerCreate(_ context.Context, config *container.Config
 	}
 	id := "container-" + name
 	f.creates = append(f.creates, createCall{name: name, config: config, host: hostConfig, network: net})
+	if name == "" {
+		name = "fake-health-probe"
+	}
 	f.containers[name] = container.InspectResponse{
 		ContainerJSONBase: &container.ContainerJSONBase{
-			ID:    id,
-			Name:  "/" + name,
-			State: &container.State{Running: false},
+			ID:         id,
+			Name:       "/" + name,
+			State:      &container.State{Running: false},
+			Image:      "sha256:fake",
+			HostConfig: hostConfig,
 		},
+		Config: config,
 	}
 	return container.CreateResponse{ID: id}, nil
 }
@@ -186,7 +203,11 @@ func (f *fakeDocker) ContainerStart(_ context.Context, id string, _ container.St
 	for name, c := range f.containers {
 		if c.ID == id {
 			// A fresh State avoids aliasing the pointer a caller already holds.
-			c.State = &container.State{Running: true}
+			running := true
+			if len(c.Config.Cmd) > 0 {
+				running = false
+			}
+			c.State = &container.State{Running: running, ExitCode: f.healthExit}
 			f.containers[name] = c
 		}
 	}
@@ -197,11 +218,20 @@ func (f *fakeDocker) ContainerStop(_ context.Context, id string, _ container.Sto
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	c, ok := f.containers[id]
+	name := id
 	if !ok {
-		return notFound("container " + id)
+		for key, candidate := range f.containers {
+			if candidate.ID == id {
+				name, c, ok = key, candidate, true
+				break
+			}
+		}
+		if !ok {
+			return notFound("container " + id)
+		}
 	}
 	c.State = &container.State{Running: false}
-	f.containers[id] = c
+	f.containers[name] = c
 	f.stopped = append(f.stopped, id)
 	return nil
 }
@@ -209,10 +239,20 @@ func (f *fakeDocker) ContainerStop(_ context.Context, id string, _ container.Sto
 func (f *fakeDocker) ContainerRemove(_ context.Context, id string, _ container.RemoveOptions) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.containers[id]; !ok {
-		return notFound("container " + id)
+	name := id
+	if _, ok := f.containers[name]; !ok {
+		for key, c := range f.containers {
+			if c.ID == id {
+				name = key
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return notFound("container " + id)
+		}
 	}
-	delete(f.containers, id)
+	delete(f.containers, name)
 	f.removed = append(f.removed, id)
 	return nil
 }

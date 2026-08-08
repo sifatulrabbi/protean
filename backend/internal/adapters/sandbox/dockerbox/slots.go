@@ -69,14 +69,18 @@ func (s *slots) adopt() {
 func (s *slots) release() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.waiters) > 0 {
-		ch := s.waiters[0]
-		s.waiters = s.waiters[1:]
-		close(ch)
+	if s.used > s.limit {
+		s.used--
 		return
 	}
 	if s.used > 0 {
 		s.used--
+	}
+	if len(s.waiters) > 0 && s.used < s.limit {
+		s.used++
+		ch := s.waiters[0]
+		s.waiters = s.waiters[1:]
+		close(ch)
 	}
 }
 

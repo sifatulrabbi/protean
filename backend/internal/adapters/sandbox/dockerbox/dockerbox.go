@@ -15,7 +15,7 @@
 //   - Networking is disabled outright. The allowlist egress proxy is the next
 //     slice (S3); until it exists the sandbox is default-closed rather than
 //     open to the internet.
-//   - The container runs as the image's non-root user, publishes no ports, and
+//   - The container runs as an explicit numeric non-root user, publishes no ports, and
 //     is never auto-removed — this runtime owns its lifecycle.
 //
 // The remaining hardening flags from the design (cap-drop, no-new-privileges,
@@ -79,6 +79,10 @@ const (
 	// stopGracePeriod is how long a container gets to exit on SIGTERM before
 	// the daemon kills it.
 	stopGracePeriod = 5 * time.Second
+
+	// sandboxUser is deliberately numeric so container execution never depends
+	// on a mutable image's passwd database or default USER directive.
+	sandboxUser = "10001:10001"
 )
 
 // refPattern keeps container names well-formed and unambiguous: ULIDs pass, and
@@ -183,6 +187,7 @@ type state struct {
 	running      bool
 	holdsSlot    bool
 	lastActivity time.Time
+	active       int
 
 	// uid/gid of the container user, discovered once and reused so written
 	// files land owned by the sandbox user rather than root.
@@ -234,9 +239,30 @@ func (r *Runtime) adoptRunning(ctx context.Context) error {
 			continue
 		}
 
+		name := ContainerName(ref)
+		insp, err := r.api.ContainerInspect(ctx, c.ID)
+		if err != nil {
+			return fmt.Errorf("inspect running sandbox %s: %w", name, err)
+		}
+		if err := r.validateContainer(ctx, ref, insp); err != nil {
+			r.log.Warn("sandbox: replacing running container with invalid security configuration",
+				"org_id", ref.OrgID, "project_id", ref.ProjectID, "container_id", c.ID, "err", err)
+			if err := r.api.ContainerRemove(ctx, c.ID, container.RemoveOptions{Force: true}); err != nil && !client.IsErrNotFound(err) {
+				return fmt.Errorf("remove invalid sandbox %s: %w", name, err)
+			}
+			id, err := r.create(ctx, ref)
+			if err != nil {
+				return fmt.Errorf("recreate invalid sandbox %s: %w", name, err)
+			}
+			if err := r.api.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
+				return fmt.Errorf("start recreated sandbox %s: %w", name, err)
+			}
+			insp.ID = id
+		}
+
 		st := r.stateFor(ref)
 		r.mu.Lock()
-		st.containerID = c.ID
+		st.containerID = insp.ID
 		st.running = true
 		st.holdsSlot = true
 		st.lastActivity = now
@@ -244,7 +270,7 @@ func (r *Runtime) adoptRunning(ctx context.Context) error {
 		r.slots.adopt()
 
 		r.log.Info("sandbox: adopted running container",
-			"org_id", ref.OrgID, "project_id", ref.ProjectID, "container_id", c.ID)
+			"org_id", ref.OrgID, "project_id", ref.ProjectID, "container_id", insp.ID)
 	}
 	return nil
 }
@@ -279,11 +305,31 @@ func (r *Runtime) ensure(ctx context.Context, ref ports.ProjectRef) (string, err
 	st := r.stateFor(ref)
 	st.opMu.Lock()
 	defer st.opMu.Unlock()
+	return r.ensureLocked(ctx, ref, st)
+}
+
+func (r *Runtime) ensureLocked(ctx context.Context, ref ports.ProjectRef, st *state) (string, error) {
 
 	name := ContainerName(ref)
 	insp, err := r.api.ContainerInspect(ctx, name)
 	switch {
 	case err == nil:
+		if invariantErr := r.validateContainer(ctx, ref, insp); invariantErr != nil {
+			r.log.Warn("sandbox: replacing container with invalid security configuration",
+				"org_id", ref.OrgID, "project_id", ref.ProjectID, "container_id", insp.ID, "err", invariantErr)
+			if err := r.api.ContainerRemove(ctx, insp.ID, container.RemoveOptions{Force: true}); err != nil && !client.IsErrNotFound(err) {
+				return "", fmt.Errorf("remove invalid sandbox %s: %w", name, err)
+			}
+			r.releaseSlot(st)
+			id, err := r.create(ctx, ref)
+			if err != nil {
+				return "", err
+			}
+			if err := r.startExisting(ctx, ref, st, id); err != nil {
+				return "", err
+			}
+			return id, nil
+		}
 		if insp.State != nil && insp.State.Running {
 			r.noteRunning(st, insp.ID)
 			return insp.ID, nil
@@ -306,6 +352,38 @@ func (r *Runtime) ensure(ctx context.Context, ref ports.ProjectRef) (string, err
 	default:
 		return "", fmt.Errorf("inspect sandbox %s: %w", name, err)
 	}
+}
+
+// beginOperation takes an activity lease before the reaper can stop the
+// container. The lease lasts for the whole sandbox operation, not merely the
+// Ensure call that precedes it.
+func (r *Runtime) beginOperation(ctx context.Context, ref ports.ProjectRef) (string, func(), error) {
+	if err := validateRef(ref); err != nil {
+		return "", nil, err
+	}
+	st := r.stateFor(ref)
+	st.opMu.Lock()
+	r.mu.Lock()
+	st.active++
+	st.lastActivity = r.clock.Now()
+	r.mu.Unlock()
+	id, err := r.ensureLocked(ctx, ref, st)
+	st.opMu.Unlock()
+	if err != nil {
+		r.finishOperation(st)
+		return "", nil, err
+	}
+	var once sync.Once
+	return id, func() { once.Do(func() { r.finishOperation(st) }) }, nil
+}
+
+func (r *Runtime) finishOperation(st *state) {
+	r.mu.Lock()
+	if st.active > 0 {
+		st.active--
+	}
+	st.lastActivity = r.clock.Now()
+	r.mu.Unlock()
 }
 
 // startExisting takes a concurrency slot, unless this project already holds
@@ -390,6 +468,7 @@ func (r *Runtime) create(ctx context.Context, ref ports.ProjectRef) (string, err
 
 	cfg := &container.Config{
 		Image:      r.opts.Image,
+		User:       sandboxUser,
 		WorkingDir: sandbox.WorkspaceRoot,
 		Labels: map[string]string{
 			LabelManaged: "true",
@@ -402,6 +481,7 @@ func (r *Runtime) create(ctx context.Context, ref ports.ProjectRef) (string, err
 	}
 
 	pids := r.opts.PidsLimit
+	initProcess := true
 	hostCfg := &container.HostConfig{
 		Mounts: []mount.Mount{
 			{Type: mount.TypeBind, Source: layout.projectDir, Target: sandbox.WorkspaceRoot},
@@ -410,6 +490,7 @@ func (r *Runtime) create(ctx context.Context, ref ports.ProjectRef) (string, err
 		},
 		NetworkMode:   "none",
 		AutoRemove:    false,
+		Init:          &initProcess,
 		RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyDisabled},
 		Resources: container.Resources{
 			NanoCPUs:   r.opts.NanoCPUs,
@@ -427,6 +508,76 @@ func (r *Runtime) create(ctx context.Context, ref ports.ProjectRef) (string, err
 	r.log.Info("sandbox: created",
 		"org_id", ref.OrgID, "project_id", ref.ProjectID, "container_id", created.ID, "image", r.opts.Image)
 	return created.ID, nil
+}
+
+func (r *Runtime) validateContainer(ctx context.Context, ref ports.ProjectRef, insp container.InspectResponse) error {
+	if insp.Name != "/"+ContainerName(ref) {
+		return fmt.Errorf("canonical name is %q, want %q", insp.Name, "/"+ContainerName(ref))
+	}
+	if insp.Config == nil || insp.HostConfig == nil {
+		return errors.New("container inspect omitted config")
+	}
+	labels := insp.Config.Labels
+	if labels[LabelManaged] != "true" || labels[LabelOrg] != ref.OrgID || labels[LabelProject] != ref.ProjectID {
+		return fmt.Errorf("project labels do not match %s/%s", ref.OrgID, ref.ProjectID)
+	}
+	imageInfo, err := r.api.ImageInspect(ctx, r.opts.Image)
+	if err != nil {
+		if client.IsErrNotFound(err) {
+			return fmt.Errorf("%w: %q is not present; run `make sandbox-image`", ErrImageMissing, r.opts.Image)
+		}
+		return fmt.Errorf("inspect configured image %q: %w", r.opts.Image, err)
+	}
+	if insp.Config.Image != r.opts.Image || insp.Image != imageInfo.ID {
+		return fmt.Errorf("image is %q (%s), want %q (%s)", insp.Config.Image, insp.Image, r.opts.Image, imageInfo.ID)
+	}
+	if insp.Config.User != sandboxUser {
+		return fmt.Errorf("user is %q, want explicit non-root %q", insp.Config.User, sandboxUser)
+	}
+	if !insp.Config.NetworkDisabled || string(insp.HostConfig.NetworkMode) != "none" {
+		return errors.New("networking is not disabled")
+	}
+	if insp.HostConfig.NanoCPUs != r.opts.NanoCPUs || insp.HostConfig.Memory != r.opts.MemoryBytes ||
+		insp.HostConfig.MemorySwap != r.opts.MemoryBytes || insp.HostConfig.PidsLimit == nil ||
+		*insp.HostConfig.PidsLimit != r.opts.PidsLimit {
+		return errors.New("resource limits do not match runtime configuration")
+	}
+	if insp.HostConfig.RestartPolicy.Name != container.RestartPolicyDisabled || insp.HostConfig.RestartPolicy.MaximumRetryCount != 0 {
+		return errors.New("restart policy is enabled")
+	}
+	if insp.HostConfig.AutoRemove {
+		return errors.New("automatic removal is enabled")
+	}
+	if insp.HostConfig.Init == nil || !*insp.HostConfig.Init {
+		return errors.New("container init process is not enabled")
+	}
+
+	layout, err := r.prepareHost(ref)
+	if err != nil {
+		return err
+	}
+	want := []mount.Mount{
+		{Type: mount.TypeBind, Source: layout.projectDir, Target: sandbox.WorkspaceRoot},
+		{Type: mount.TypeBind, Source: layout.maskDir, Target: layout.controlTarget, ReadOnly: true},
+		{Type: mount.TypeBind, Source: layout.agentsFile, Target: layout.agentsTarget, ReadOnly: true},
+	}
+	if !sameMounts(insp.HostConfig.Mounts, want) {
+		return errors.New("mounts do not exactly match the approved workspace, control mask, and AGENTS.md mounts")
+	}
+	return nil
+}
+
+func sameMounts(got, want []mount.Mount) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i].Type != want[i].Type || got[i].Source != want[i].Source || got[i].Target != want[i].Target ||
+			got[i].ReadOnly != want[i].ReadOnly || got[i].BindOptions != nil || got[i].VolumeOptions != nil || got[i].TmpfsOptions != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // hostLayout is the set of host paths one sandbox needs.
@@ -455,12 +606,33 @@ func (r *Runtime) prepareHost(ref ports.ProjectRef) (hostLayout, error) {
 		return hostLayout{}, fmt.Errorf("create sandbox mask dir: %w", err)
 	}
 
+	resolvedProject, err := filepath.EvalSymlinks(projectDir)
+	if err != nil {
+		return hostLayout{}, fmt.Errorf("resolve project directory: %w", err)
+	}
 	agentsFile := filepath.Join(projectDir, sandbox.AgentsFileName)
 	f, err := os.OpenFile(agentsFile, os.O_RDONLY|os.O_CREATE, 0o644)
 	if err != nil {
-		return hostLayout{}, fmt.Errorf("create %s: %w", sandbox.AgentsFileName, err)
+		if err := os.Remove(agentsFile); err != nil {
+			return hostLayout{}, fmt.Errorf("replace unsafe %s: %w", sandbox.AgentsFileName, err)
+		}
+		f, err = os.OpenFile(agentsFile, os.O_RDONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			return hostLayout{}, fmt.Errorf("create safe %s: %w", sandbox.AgentsFileName, err)
+		}
 	}
 	_ = f.Close()
+	resolvedAgents, err := filepath.EvalSymlinks(agentsFile)
+	if err != nil || !pathWithin(resolvedProject, resolvedAgents) || resolvedAgents != filepath.Join(resolvedProject, sandbox.AgentsFileName) {
+		if removeErr := os.Remove(agentsFile); removeErr != nil {
+			return hostLayout{}, fmt.Errorf("replace unsafe %s symlink: %w", sandbox.AgentsFileName, removeErr)
+		}
+		f, createErr := os.OpenFile(agentsFile, os.O_RDONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if createErr != nil {
+			return hostLayout{}, fmt.Errorf("create safe %s: %w", sandbox.AgentsFileName, createErr)
+		}
+		_ = f.Close()
+	}
 
 	layout := hostLayout{
 		projectDir:    projectDir,
@@ -477,6 +649,11 @@ func (r *Runtime) prepareHost(ref ports.ProjectRef) (hostLayout, error) {
 		*p = resolved
 	}
 	return layout, nil
+}
+
+func pathWithin(root, candidate string) bool {
+	rel, err := filepath.Rel(root, candidate)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // ProjectDir is the host directory bind-mounted at the workspace root.
@@ -508,6 +685,33 @@ func (r *Runtime) stopLocked(ctx context.Context, ref ports.ProjectRef, st *stat
 	r.releaseSlot(st)
 	r.log.Info("sandbox: stopped",
 		"org_id", ref.OrgID, "project_id", ref.ProjectID, "running", r.slots.inUse())
+	return nil
+}
+
+// replaceContainer force-removes a sandbox whose exec could not be proven
+// dead, then recreates it from the canonical configuration. Project files are
+// preserved because they live in the host bind mount.
+func (r *Runtime) replaceContainer(ctx context.Context, ref ports.ProjectRef) error {
+	st := r.stateFor(ref)
+	st.opMu.Lock()
+	defer st.opMu.Unlock()
+	name := ContainerName(ref)
+	if err := r.api.ContainerRemove(ctx, name, container.RemoveOptions{Force: true}); err != nil && !client.IsErrNotFound(err) {
+		return fmt.Errorf("force-remove sandbox %s: %w", name, err)
+	}
+	r.mu.Lock()
+	st.running = false
+	st.idsKnown = false
+	r.mu.Unlock()
+	id, err := r.create(ctx, ref)
+	if err != nil {
+		r.releaseSlot(st)
+		return err
+	}
+	if err := r.startExisting(ctx, ref, st, id); err != nil {
+		r.releaseSlot(st)
+		return err
+	}
 	return nil
 }
 
@@ -592,11 +796,21 @@ func (r *Runtime) reap(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		st := r.stateFor(ref)
+		st.opMu.Lock()
+		r.mu.Lock()
+		stillIdle := st.running && st.active == 0 && r.clock.Now().Sub(st.lastActivity) >= r.opts.IdleTimeout
+		r.mu.Unlock()
+		if !stillIdle {
+			st.opMu.Unlock()
+			continue
+		}
 		r.log.Info("sandbox: reaping idle sandbox",
 			"org_id", ref.OrgID, "project_id", ref.ProjectID, "idle_timeout", r.opts.IdleTimeout)
-		if err := r.Stop(ctx, ref); err != nil {
+		if err := r.stopLocked(ctx, ref, st); err != nil {
 			r.log.Error("sandbox: reaping failed", "org_id", ref.OrgID, "project_id", ref.ProjectID, "err", err)
 		}
+		st.opMu.Unlock()
 	}
 }
 

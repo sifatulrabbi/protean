@@ -1,6 +1,7 @@
 package dockerbox
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -40,6 +41,8 @@ const (
 	inspectPollTimeout  = 3 * time.Second
 )
 
+var errExecStillRunning = errors.New("sandbox exec is still running after its termination deadline")
+
 // sandboxHandle implements ports.Sandbox. It re-resolves the container before
 // every operation so a handle stays usable after the idle reaper stopped the
 // sandbox underneath it.
@@ -71,10 +74,6 @@ func (s *sandboxHandle) container(ctx context.Context) (string, error) {
 // command that spawned children takes its process tree down with it. The host
 // deadline below it only guards against a stuck daemon connection.
 func (s *sandboxHandle) Exec(ctx context.Context, spec ports.ExecSpec) (ports.ExecResult, error) {
-	id, err := s.container(ctx)
-	if err != nil {
-		return ports.ExecResult{}, err
-	}
 	if strings.TrimSpace(spec.Command) == "" {
 		return ports.ExecResult{}, errors.New("sandbox: exec command is empty")
 	}
@@ -83,12 +82,18 @@ func (s *sandboxHandle) Exec(ctx context.Context, spec ports.ExecSpec) (ports.Ex
 	if err != nil {
 		return ports.ExecResult{}, fmt.Errorf("sandbox: exec cwd: %w", err)
 	}
+	id, finish, err := s.rt.beginOperation(ctx, s.ref)
+	if err != nil {
+		return ports.ExecResult{}, err
+	}
+	defer finish()
+	s.containerID = id
 
 	timeout := s.rt.execTimeout(spec.Timeout)
 	execCfg := container.ExecOptions{
 		Cmd:          wrapCommand(spec.Command, timeout),
 		WorkingDir:   workDir,
-		Env:          spec.Env,
+		Env:          safeExecEnv(spec.Env),
 		AttachStdout: true,
 		AttachStderr: true,
 	}
@@ -139,16 +144,35 @@ func (s *sandboxHandle) Exec(ctx context.Context, spec ports.ExecSpec) (ports.Ex
 
 	if copyErr != nil && !drain.over && !hostDeadlineFired {
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ports.ExecResult{}, ctxErr
+			return ports.ExecResult{}, s.resetExecError(ctxErr)
 		}
 		return ports.ExecResult{}, fmt.Errorf("read exec output from %s: %w", ContainerName(s.ref), copyErr)
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ports.ExecResult{}, ctxErr
+		return ports.ExecResult{}, s.resetExecError(ctxErr)
+	}
+	if drain.over || hostDeadlineFired {
+		reason := "output cutoff"
+		if hostDeadlineFired {
+			reason = "host execution deadline"
+		}
+		if err := s.resetAfterExec(reason); err != nil {
+			return ports.ExecResult{}, err
+		}
+		return ports.ExecResult{
+			ExitCode:  exitKilled,
+			Stdout:    stdout.String(),
+			Stderr:    stderr.String() + "\nprotean: sandbox recreated after " + reason + "\n",
+			Truncated: true,
+			TimedOut:  hostDeadlineFired,
+		}, nil
 	}
 
 	exitCode, err := s.waitExit(ctx, created.ID)
 	if err != nil {
+		if errors.Is(err, errExecStillRunning) {
+			return ports.ExecResult{}, s.resetExecError(err)
+		}
 		return ports.ExecResult{}, err
 	}
 
@@ -164,6 +188,114 @@ func (s *sandboxHandle) Exec(ctx context.Context, spec ports.ExecSpec) (ports.Ex
 	return result, nil
 }
 
+func safeExecEnv(env []string) []string {
+	critical := map[string]bool{
+		"PATH": true, "IFS": true, "ENV": true, "BASH_ENV": true, "SHELLOPTS": true,
+		"LD_PRELOAD": true, "LD_LIBRARY_PATH": true,
+	}
+	out := make([]string, 0, len(env)+1)
+	for _, entry := range env {
+		name, _, ok := strings.Cut(entry, "=")
+		if !ok || critical[name] {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return append(out, "PATH=/usr/local/bin:/usr/bin:/bin")
+}
+
+func (s *sandboxHandle) resetExecError(cause error) error {
+	if err := s.resetAfterExec(cause.Error()); err != nil {
+		return errors.Join(cause, err)
+	}
+	return fmt.Errorf("%w; sandbox was recreated to guarantee process termination", cause)
+}
+
+func (s *sandboxHandle) resetAfterExec(reason string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := s.rt.replaceContainer(ctx, s.ref); err != nil {
+		return fmt.Errorf("sandbox: could not recreate %s after %s: %w", ContainerName(s.ref), reason, err)
+	}
+	insp, err := s.rt.api.ContainerInspect(ctx, ContainerName(s.ref))
+	if err != nil {
+		return fmt.Errorf("sandbox: inspect recreated %s after %s: %w", ContainerName(s.ref), reason, err)
+	}
+	s.containerID = insp.ID
+	return nil
+}
+
+// execInput is the narrow stdin-capable exec used by WriteFile. Supplying file
+// bytes over the hijacked exec stream avoids Docker tar extraction, whose path
+// walk can be raced through workspace symlinks.
+func (s *sandboxHandle) execInput(ctx context.Context, id, command string, input []byte, timeout time.Duration) (ports.ExecResult, error) {
+	execCfg := container.ExecOptions{
+		Cmd:          wrapInputCommand(command, timeout),
+		WorkingDir:   sandbox.WorkspaceRoot,
+		Env:          safeExecEnv(nil),
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+	}
+	created, err := s.rt.api.ContainerExecCreate(ctx, id, execCfg)
+	if err != nil {
+		return ports.ExecResult{}, err
+	}
+	execCtx, cancel := context.WithTimeout(ctx, timeout+killGrace+attachSlack)
+	defer cancel()
+	resp, err := s.rt.api.ContainerExecAttach(execCtx, created.ID, container.ExecAttachOptions{})
+	if err != nil {
+		return ports.ExecResult{}, err
+	}
+	defer resp.Close()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := io.Copy(resp.Conn, bytes.NewReader(input))
+		if closeErr := resp.CloseWrite(); err == nil {
+			err = closeErr
+		}
+		writeDone <- err
+	}()
+	stdout := &capWriter{limit: s.rt.opts.OutputCapBytes}
+	stderr := &capWriter{limit: s.rt.opts.OutputCapBytes}
+	_, copyErr := stdcopy.StdCopy(stdout, stderr, resp.Reader)
+	writeErr := <-writeDone
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ports.ExecResult{}, s.resetExecError(ctxErr)
+	}
+	if execCtx.Err() != nil {
+		return ports.ExecResult{}, s.resetExecError(execCtx.Err())
+	}
+	if writeErr != nil && !errors.Is(writeErr, io.ErrClosedPipe) {
+		return ports.ExecResult{}, fmt.Errorf("send exec input: %w", writeErr)
+	}
+	if copyErr != nil {
+		return ports.ExecResult{}, fmt.Errorf("read exec output: %w", copyErr)
+	}
+	exitCode, err := s.waitExit(ctx, created.ID)
+	if err != nil {
+		if errors.Is(err, errExecStillRunning) {
+			return ports.ExecResult{}, s.resetExecError(err)
+		}
+		return ports.ExecResult{}, err
+	}
+	return ports.ExecResult{ExitCode: exitCode, Stdout: stdout.String(), Stderr: stderr.String()}, nil
+}
+
+func wrapInputCommand(command string, timeout time.Duration) []string {
+	secs := int(timeout.Round(time.Second) / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	return []string{
+		"/usr/bin/timeout",
+		"--kill-after=" + strconv.Itoa(int(killGrace/time.Second)) + "s",
+		strconv.Itoa(secs) + "s",
+		"/usr/bin/setsid", "/bin/sh", "-lc", command,
+	}
+}
+
 // waitExit polls until the daemon reports the exec finished, then returns its
 // exit code.
 func (s *sandboxHandle) waitExit(ctx context.Context, execID string) (int, error) {
@@ -177,7 +309,7 @@ func (s *sandboxHandle) waitExit(ctx context.Context, execID string) (int, error
 			return insp.ExitCode, nil
 		}
 		if time.Now().After(deadline) {
-			return insp.ExitCode, nil
+			return 0, errExecStillRunning
 		}
 		select {
 		case <-ctx.Done():
@@ -202,18 +334,42 @@ func (r *Runtime) execTimeout(requested time.Duration) time.Duration {
 	return requested
 }
 
-// wrapCommand builds the argv the daemon runs. `timeout` is the process-group
-// killer; `sh -lc` is the shell the agent's command line expects.
+// wrapCommand builds the argv the daemon runs. The absolute timeout path cannot
+// be replaced by a workspace file or hostile PATH. The inner shell starts in a
+// new session, and the outer supervisor always kills that whole process group,
+// including background work, before it exits.
 func wrapCommand(command string, timeout time.Duration) []string {
 	secs := int(timeout.Round(time.Second) / time.Second)
 	if secs < 1 {
 		secs = 1
 	}
 	return []string{
-		"timeout",
+		"/usr/bin/timeout",
 		"--kill-after=" + strconv.Itoa(int(killGrace/time.Second)) + "s",
 		strconv.Itoa(secs) + "s",
-		"/bin/sh", "-lc", command,
+		"/bin/sh", "-c", `
+child=
+cleanup() {
+  rc=$?
+  trap - EXIT HUP INT TERM
+  if [ -n "$child" ]; then
+    /bin/kill -TERM -- "-$child" 2>/dev/null || true
+    i=0
+    while [ "$i" -lt 10 ] && /bin/kill -0 -- "-$child" 2>/dev/null; do
+      /bin/sleep 0.1
+      i=$((i+1))
+    done
+    /bin/kill -KILL -- "-$child" 2>/dev/null || true
+    wait "$child" 2>/dev/null || true
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT HUP INT TERM
+/usr/bin/setsid /bin/sh -lc "$1" <&0 &
+child=$!
+wait "$child"
+exit $?
+`, "protean-supervisor", command,
 	}
 }
 
