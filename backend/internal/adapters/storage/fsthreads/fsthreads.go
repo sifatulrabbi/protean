@@ -57,6 +57,7 @@ type Store struct {
 	ids     *ulid.Generator
 	log     *slog.Logger
 	locks   *keyedMutex
+	syncDir func(string) error
 
 	// afterStage is a test seam: it runs after a temp file is written and
 	// before it is committed, so the tests can prove that a failure between
@@ -72,14 +73,17 @@ func New(opts Options) *Store {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Store{
+	s := &Store{
 		dataDir: filepath.Clean(opts.DataDir),
 		ent:     opts.Entitlements,
 		clock:   opts.Clock,
 		ids:     ulid.NewGenerator(opts.Clock),
 		log:     logger.With("component", "fsthreads"),
 		locks:   newKeyedMutex(),
+		syncDir: syncDir,
 	}
+	s.scavengeTemps()
+	return s
 }
 
 // CreateThread mints a thread ULID and writes its thread.json.
@@ -87,10 +91,6 @@ func (s *Store) CreateThread(ctx context.Context, orgID, projectID, title string
 	if err := checkProject(orgID, projectID); err != nil {
 		return ports.Thread{}, err
 	}
-	if err := layout.EnsureProject(s.dataDir, orgID, projectID); err != nil {
-		return ports.Thread{}, err
-	}
-
 	now := s.clock.Now().UTC()
 	thread := ports.Thread{
 		ID:        s.ids.New(),
@@ -105,9 +105,7 @@ func (s *Store) CreateThread(ctx context.Context, orgID, projectID, title string
 	unlock := s.locks.lock(s.key(orgID, projectID, thread.ID))
 	defer unlock()
 
-	if err := s.writeThread(ctx, thread); err != nil {
-		// The thread never existed, so its directory is ours to remove.
-		_ = os.RemoveAll(layout.ThreadDir(s.dataDir, orgID, projectID, thread.ID))
+	if err := s.writeThread(ctx, orgID, projectID, thread.ID, thread, true); err != nil {
 		return ports.Thread{}, err
 	}
 	return thread, nil
@@ -176,7 +174,7 @@ func (s *Store) UpdateTasks(ctx context.Context, orgID, projectID, threadID stri
 	thread.Tasks = append([]ports.Task{}, tasks...)
 	thread.UpdatedAt = s.clock.Now().UTC()
 
-	if err := s.writeThread(ctx, thread); err != nil {
+	if err := s.writeThread(ctx, orgID, projectID, threadID, thread, false); err != nil {
 		return ports.Thread{}, err
 	}
 	return thread, nil
@@ -212,9 +210,11 @@ func (s *Store) AppendMessage(ctx context.Context, orgID, projectID, threadID, r
 		return ports.Message{}, err
 	}
 
-	if err := s.ent.CheckDiskWrite(ctx, orgID, int64(len(data))); err != nil {
+	admission, err := s.reserveDiskWrite(ctx, orgID, int64(len(data)))
+	if err != nil {
 		return ports.Message{}, err
 	}
+	defer admission.Release()
 
 	dir := layout.MessagesDir(s.dataDir, orgID, projectID, threadID)
 	tmp, err := s.stage(dir, data)
@@ -222,7 +222,7 @@ func (s *Store) AppendMessage(ctx context.Context, orgID, projectID, threadID, r
 		return ports.Message{}, err
 	}
 	target := layout.MessagePath(s.dataDir, orgID, projectID, threadID, msg.ID)
-	if err := commitLink(tmp, target); err != nil {
+	if err := s.commitLink(tmp, target); err != nil {
 		if errors.Is(err, fs.ErrExist) {
 			return ports.Message{}, fmt.Errorf("%s: %w", msg.ID, ports.ErrMessageExists)
 		}
@@ -283,27 +283,58 @@ func (s *Store) GetMessage(_ context.Context, orgID, projectID, threadID, messag
 
 // writeThread preflights the quota and then replaces thread.json atomically.
 // It assumes the caller holds the thread lock.
-func (s *Store) writeThread(ctx context.Context, thread ports.Thread) error {
+func (s *Store) writeThread(ctx context.Context, orgID, projectID, threadID string, thread ports.Thread, create bool) error {
 	data, err := marshal(thread)
 	if err != nil {
 		return err
 	}
-	// The delta is the whole serialized size rather than the growth over the
-	// previous version: overcounting an update by a few hundred bytes is the
-	// safe direction to be wrong in a quota preflight.
-	if err := s.ent.CheckDiskWrite(ctx, thread.OrgID, int64(len(data))); err != nil {
-		return err
+
+	target := layout.ThreadJSONPath(s.dataDir, orgID, projectID, threadID)
+	oldSize := int64(0)
+	if !create {
+		info, err := os.Stat(target)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return fmt.Errorf("%s: %w", threadID, ports.ErrThreadNotFound)
+			}
+			return fmt.Errorf("stat %q: %w", target, err)
+		}
+		oldSize = info.Size()
 	}
 
-	dir := layout.ThreadDir(s.dataDir, thread.OrgID, thread.ProjectID, thread.ID)
-	if err := os.MkdirAll(filepath.Join(dir, layout.MessagesDirName), dirMode); err != nil {
-		return fmt.Errorf("create %q: %w", dir, err)
+	admission, err := s.reserveDiskWrite(ctx, orgID, int64(len(data))-oldSize)
+	if err != nil {
+		return err
+	}
+	defer admission.Release()
+
+	if create {
+		if err := layout.EnsureProject(s.dataDir, orgID, projectID); err != nil {
+			return err
+		}
+	}
+
+	dir := layout.ThreadDir(s.dataDir, orgID, projectID, threadID)
+	created, err := s.ensureThreadDirs(orgID, projectID, threadID)
+	if err != nil {
+		if created {
+			s.removeThreadDir(orgID, projectID, threadID)
+		}
+		return err
+	}
+	if created {
+		defer func() {
+			if _, err := os.Stat(target); err == nil {
+				return
+			}
+			s.removeThreadDir(orgID, projectID, threadID)
+		}()
 	}
 	tmp, err := s.stage(dir, data)
 	if err != nil {
 		return err
 	}
-	return commitRename(tmp, layout.ThreadJSONPath(s.dataDir, thread.OrgID, thread.ProjectID, thread.ID))
+	return s.commitRename(tmp, target)
 }
 
 func (s *Store) readThread(orgID, projectID, threadID string) (ports.Thread, error) {
@@ -324,6 +355,18 @@ func (s *Store) readThread(orgID, projectID, threadID string) (ports.Thread, err
 		return ports.Thread{}, &ports.CorruptFileError{
 			Path: path,
 			Err:  fmt.Errorf("thread id %q does not match its directory", thread.ID),
+		}
+	}
+	if thread.OrgID != orgID {
+		return ports.Thread{}, &ports.CorruptFileError{
+			Path: path,
+			Err:  fmt.Errorf("org id %q does not match its path scope %q", thread.OrgID, orgID),
+		}
+	}
+	if thread.ProjectID != projectID {
+		return ports.Thread{}, &ports.CorruptFileError{
+			Path: path,
+			Err:  fmt.Errorf("project id %q does not match its path scope %q", thread.ProjectID, projectID),
 		}
 	}
 	if thread.Tasks == nil {
@@ -370,6 +413,43 @@ func (s *Store) requireThread(orgID, projectID, threadID string) error {
 func (s *Store) key(orgID, projectID, threadID string) string {
 	return orgID + "/" + projectID + "/" + threadID
 }
+
+func (s *Store) removeThreadDir(orgID, projectID, threadID string) {
+	dir := layout.ThreadDir(s.dataDir, orgID, projectID, threadID)
+	if err := os.RemoveAll(dir); err != nil {
+		s.log.Warn("failed to clean uncommitted thread directory", "path", dir, "err", err)
+		return
+	}
+	if err := s.syncDir(layout.ThreadsDir(s.dataDir, orgID, projectID)); err != nil {
+		s.log.Warn("failed to sync cleaned thread directory", "path", dir, "err", err)
+	}
+}
+
+type diskWriteReserver interface {
+	ReserveDiskWrite(context.Context, string, int64) (ports.StructuralAdmission, error)
+}
+
+var fallbackDiskAdmissions = newKeyedMutex()
+
+func (s *Store) reserveDiskWrite(ctx context.Context, orgID string, deltaBytes int64) (ports.StructuralAdmission, error) {
+	if deltaBytes <= 0 {
+		return releaseFunc(func() {}), nil
+	}
+	if ent, ok := s.ent.(diskWriteReserver); ok {
+		return ent.ReserveDiskWrite(ctx, orgID, deltaBytes)
+	}
+
+	release := fallbackDiskAdmissions.lock(orgID)
+	if err := s.ent.CheckDiskWrite(ctx, orgID, deltaBytes); err != nil {
+		release()
+		return nil, err
+	}
+	return releaseFunc(release), nil
+}
+
+type releaseFunc func()
+
+func (f releaseFunc) Release() { f() }
 
 // marshal renders one record. The files are indented because "everything lives
 // in the filesystem" only pays off if a human can read what is there.

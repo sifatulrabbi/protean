@@ -329,7 +329,7 @@ func TestAppendMessageNeverOverwrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stage: %v", err)
 	}
-	if err := commitLink(tmp, path); !errors.Is(err, fs.ErrExist) {
+	if err := f.store.commitLink(tmp, path); !errors.Is(err, fs.ErrExist) {
 		t.Fatalf("re-creating an existing message: got %v, want fs.ErrExist", err)
 	}
 
@@ -523,6 +523,77 @@ func TestConcurrentAppendsAreExactAndOrdered(t *testing.T) {
 	assertNoTempFiles(t, f.dataDir)
 }
 
+func TestConcurrentSameOrgAppendsAcrossThreadsRespectQuota(t *testing.T) {
+	dataDir := t.TempDir()
+	clk := newFakeClock(t, "2026-08-06T10:00:00Z")
+	ent := newQuotaEntitlements(dataDir)
+	store := New(Options{
+		DataDir:      dataDir,
+		Entitlements: ent,
+		Clock:        clk,
+		Logger:       discardLogger(),
+	})
+	ctx := context.Background()
+	first, err := store.CreateThread(ctx, orgID, projectID, "first")
+	if err != nil {
+		t.Fatalf("create first thread: %v", err)
+	}
+	second, err := store.CreateThread(ctx, orgID, projectID, "second")
+	if err != nil {
+		t.Fatalf("create second thread: %v", err)
+	}
+
+	used, err := diskUsage(layout.OrgDir(dataDir, orgID))
+	if err != nil {
+		t.Fatalf("measure disk usage: %v", err)
+	}
+	sample, err := marshal(ports.Message{
+		ID:        strings.Repeat("0", 26),
+		Role:      "user",
+		CreatedAt: clk.Now().UTC(),
+		Content:   content("one slot"),
+	})
+	if err != nil {
+		t.Fatalf("marshal sample: %v", err)
+	}
+	ent.setLimit(used + int64(len(sample)))
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, threadID := range []string{first.ID, second.ID} {
+		go func() {
+			<-start
+			_, err := store.AppendMessage(ctx, orgID, projectID, threadID, "user", content("one slot"))
+			results <- err
+		}()
+	}
+	close(start)
+
+	var succeeded, rejected int
+	for range 2 {
+		err := <-results
+		switch {
+		case err == nil:
+			succeeded++
+		case errors.Is(err, ports.ErrDiskQuotaExceeded):
+			rejected++
+		default:
+			t.Fatalf("append returned unexpected error: %v", err)
+		}
+	}
+	if succeeded != 1 || rejected != 1 {
+		t.Fatalf("got %d successful and %d rejected appends, want one each", succeeded, rejected)
+	}
+
+	finalUsed, err := diskUsage(layout.OrgDir(dataDir, orgID))
+	if err != nil {
+		t.Fatalf("measure final disk usage: %v", err)
+	}
+	if finalUsed > ent.limitBytes() {
+		t.Fatalf("concurrent appends used %d bytes, exceeding cap %d", finalUsed, ent.limitBytes())
+	}
+}
+
 // Appends and task updates race on the same thread; the store must serialize
 // them without losing either.
 func TestConcurrentAppendsAndTaskUpdates(t *testing.T) {
@@ -659,6 +730,174 @@ func TestMismatchedThreadIDIsCorrupt(t *testing.T) {
 	}
 }
 
+func TestMismatchedThreadScopeIsCorruptAndCannotSteerUpdate(t *testing.T) {
+	tests := []struct {
+		name      string
+		mutate    func(*ports.Thread)
+		escapeDir string
+	}{
+		{
+			name:   "org",
+			mutate: func(thread *ports.Thread) { thread.OrgID = "01OTHERORG" },
+		},
+		{
+			name:   "project",
+			mutate: func(thread *ports.Thread) { thread.ProjectID = "01OTHERPROJECT" },
+		},
+		{
+			name:      "org traversal",
+			mutate:    func(thread *ports.Thread) { thread.OrgID = "../escape" },
+			escapeDir: "escape",
+		},
+		{
+			name:      "project traversal",
+			mutate:    func(thread *ports.Thread) { thread.ProjectID = "../../../escape" },
+			escapeDir: "escape",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			thread := f.mustCreate(t, "mislabeled scope")
+			path := layout.ThreadJSONPath(f.dataDir, orgID, projectID, thread.ID)
+			tt.mutate(&thread)
+			data, err := marshal(thread)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if err := os.WriteFile(path, data, fileMode); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+
+			if _, err := f.store.GetThread(context.Background(), orgID, projectID, thread.ID); !errors.Is(err, ports.ErrCorruptFile) {
+				t.Fatalf("GetThread: got %v, want ErrCorruptFile", err)
+			}
+			_, err = f.store.UpdateTasks(context.Background(), orgID, projectID, thread.ID,
+				[]ports.Task{{ID: "t1", Title: "must not escape", Status: ports.TaskTodo}})
+			if !errors.Is(err, ports.ErrCorruptFile) {
+				t.Fatalf("UpdateTasks: got %v, want ErrCorruptFile", err)
+			}
+			if tt.escapeDir != "" {
+				if _, err := os.Stat(filepath.Join(f.dataDir, tt.escapeDir)); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("traversal destination exists or cannot be checked: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestCreateThreadSyncsNewDirectoryParents(t *testing.T) {
+	f := newFixture(t)
+	var synced []string
+	f.store.syncDir = func(path string) error {
+		synced = append(synced, path)
+		return nil
+	}
+
+	thread := f.mustCreate(t, "durable")
+	threadsDir := layout.ThreadsDir(f.dataDir, orgID, projectID)
+	threadDir := layout.ThreadDir(f.dataDir, orgID, projectID, thread.ID)
+	if len(synced) < 3 {
+		t.Fatalf("synced %v, want threads parent, thread parent, and thread.json commit", synced)
+	}
+	if synced[0] != threadsDir {
+		t.Errorf("first sync = %q, want %q after creating thread directory", synced[0], threadsDir)
+	}
+	if synced[1] != threadDir {
+		t.Errorf("second sync = %q, want %q after creating messages directory", synced[1], threadDir)
+	}
+}
+
+func TestUpdateTasksPreflightsNetGrowth(t *testing.T) {
+	f := newFixture(t)
+	thread := f.mustCreate(t, "delta")
+	path := layout.ThreadJSONPath(f.dataDir, orgID, projectID, thread.ID)
+	before, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat before: %v", err)
+	}
+
+	f.clock.advance(time.Second)
+	tasks := []ports.Task{{ID: "t1", Title: strings.Repeat("grow", 20), Status: ports.TaskTodo}}
+	updated, err := f.store.UpdateTasks(context.Background(), orgID, projectID, thread.ID, tasks)
+	if err != nil {
+		t.Fatalf("UpdateTasks: %v", err)
+	}
+	data, err := marshal(updated)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	deltas := f.ent.recorded()
+	want := int64(len(data)) - before.Size()
+	if got := deltas[len(deltas)-1]; got != want {
+		t.Fatalf("update preflight delta = %d, want net growth %d", got, want)
+	}
+}
+
+func TestUpdateTasksCanShrinkAtQuota(t *testing.T) {
+	f := newFixture(t)
+	thread := f.mustCreate(t, "shrink")
+	tasks := []ports.Task{{ID: "t1", Title: strings.Repeat("large", 100), Status: ports.TaskTodo}}
+	if _, err := f.store.UpdateTasks(context.Background(), orgID, projectID, thread.ID, tasks); err != nil {
+		t.Fatalf("grow tasks: %v", err)
+	}
+	checksBefore := len(f.ent.recorded())
+	f.ent.reject(ports.ErrOrgReadOnly)
+
+	updated, err := f.store.UpdateTasks(context.Background(), orgID, projectID, thread.ID, nil)
+	if err != nil {
+		t.Fatalf("shrink at quota: %v", err)
+	}
+	if len(updated.Tasks) != 0 {
+		t.Fatalf("tasks not cleared: %v", updated.Tasks)
+	}
+	if got := len(f.ent.recorded()); got != checksBefore {
+		t.Fatalf("shrink performed a quota check: got %d checks, want %d", got, checksBefore)
+	}
+}
+
+func TestRejectedCreateLeavesNoSkeleton(t *testing.T) {
+	f := newFixture(t)
+	f.ent.reject(ports.ErrDiskQuotaExceeded)
+
+	if _, err := f.store.CreateThread(context.Background(), orgID, projectID, "rejected"); !errors.Is(err, ports.ErrDiskQuotaExceeded) {
+		t.Fatalf("CreateThread: got %v, want ErrDiskQuotaExceeded", err)
+	}
+	if _, err := os.Stat(layout.OrgsRoot(f.dataDir)); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("rejected create left a storage skeleton: %v", err)
+	}
+}
+
+func TestNewScavengesOrphanedTempFiles(t *testing.T) {
+	dataDir := t.TempDir()
+	dir := filepath.Join(layout.OrgsRoot(dataDir), orgID, "orphaned")
+	if err := os.MkdirAll(dir, dirMode); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	tmp := filepath.Join(dir, tempPrefix+"crash")
+	keep := filepath.Join(dir, "keep.json")
+	if err := os.WriteFile(tmp, []byte("partial"), fileMode); err != nil {
+		t.Fatalf("write temp: %v", err)
+	}
+	if err := os.WriteFile(keep, []byte("committed"), fileMode); err != nil {
+		t.Fatalf("write committed: %v", err)
+	}
+
+	_ = New(Options{
+		DataDir:      dataDir,
+		Entitlements: newFakeEntitlements(),
+		Clock:        newFakeClock(t, "2026-08-06T10:00:00Z"),
+		Logger:       discardLogger(),
+	})
+	if _, err := os.Stat(tmp); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("orphaned temp still exists: %v", err)
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Fatalf("committed file was scavenged: %v", err)
+	}
+}
+
 func TestIDValidationRejectsTraversal(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
@@ -720,4 +959,77 @@ func assertNoTempFiles(t *testing.T, root string) {
 	if err != nil {
 		t.Fatalf("walk %q: %v", root, err)
 	}
+}
+
+type quotaEntitlements struct {
+	*fakeEntitlements
+	root  string
+	locks *keyedMutex
+
+	mu    sync.Mutex
+	limit int64
+}
+
+var _ diskWriteReserver = (*quotaEntitlements)(nil)
+
+func newQuotaEntitlements(dataDir string) *quotaEntitlements {
+	return &quotaEntitlements{
+		fakeEntitlements: newFakeEntitlements(),
+		root:             dataDir,
+		locks:            newKeyedMutex(),
+		limit:            int64(^uint64(0) >> 1),
+	}
+}
+
+func (q *quotaEntitlements) setLimit(limit int64) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.limit = limit
+}
+
+func (q *quotaEntitlements) limitBytes() int64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.limit
+}
+
+func (q *quotaEntitlements) CheckDiskWrite(_ context.Context, orgID string, deltaBytes int64) error {
+	used, err := diskUsage(layout.OrgDir(q.root, orgID))
+	if err != nil {
+		return err
+	}
+	if deltaBytes > q.limitBytes()-used {
+		return ports.ErrDiskQuotaExceeded
+	}
+	return nil
+}
+
+func (q *quotaEntitlements) ReserveDiskWrite(ctx context.Context, orgID string, deltaBytes int64) (ports.StructuralAdmission, error) {
+	release := q.locks.lock(orgID)
+	if err := q.CheckDiskWrite(ctx, orgID, deltaBytes); err != nil {
+		release()
+		return nil, err
+	}
+	return releaseFunc(release), nil
+}
+
+func diskUsage(root string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if entry.Type().IsRegular() {
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			total += info.Size()
+		}
+		return nil
+	})
+	return total, err
 }

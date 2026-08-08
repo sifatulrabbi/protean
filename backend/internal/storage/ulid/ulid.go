@@ -23,6 +23,7 @@ type Generator struct {
 
 	mu      sync.Mutex
 	entropy *oklog.MonotonicEntropy
+	lastMS  uint64
 }
 
 // NewGenerator returns a Generator seeded from the process CSPRNG.
@@ -39,9 +40,13 @@ func (g *Generator) New() string {
 	defer g.mu.Unlock()
 
 	ms := oklog.Timestamp(g.clock.Now())
+	if ms < g.lastMS {
+		ms = g.lastMS
+	}
 	for {
 		id, err := oklog.New(ms, g.entropy)
 		if err == nil {
+			g.lastMS = ms
 			return id.String()
 		}
 		// The only failure mode is monotonic overflow: too many IDs inside one

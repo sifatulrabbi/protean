@@ -69,6 +69,19 @@ func TestOrderFollowsClock(t *testing.T) {
 	}
 }
 
+func TestMonotonicAcrossClockRollback(t *testing.T) {
+	clk := &steppingClock{now: mustTime(t, "2026-08-06T10:00:00Z")}
+	g := ulid.NewGenerator(clk)
+
+	first := g.New()
+	clk.advance(-time.Hour)
+	second := g.New()
+
+	if second <= first {
+		t.Fatalf("id after clock rollback %q does not sort after %q", second, first)
+	}
+}
+
 func TestConcurrentGenerationIsUniqueAndOrdered(t *testing.T) {
 	g := ulid.NewGenerator(frozenClock{now: mustTime(t, "2026-08-06T10:00:00Z")})
 

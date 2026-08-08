@@ -1,9 +1,14 @@
 package fsthreads
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/sifatulrabbi/protean/backend/internal/storage/layout"
 )
 
 // tempPrefix marks the store's in-flight files. It starts with a dot so a
@@ -41,7 +46,7 @@ func (s *Store) stage(dir string, data []byte) (string, error) {
 		err = s.afterStage(tmp)
 	}
 	if err != nil {
-		_ = os.Remove(tmp)
+		s.removeTemp(tmp)
 		return "", fmt.Errorf("stage %q: %w", tmp, err)
 	}
 	return tmp, nil
@@ -49,24 +54,89 @@ func (s *Store) stage(dir string, data []byte) (string, error) {
 
 // commitRename moves a staged file into place, replacing whatever was there.
 // A reader either sees the whole old file or the whole new one.
-func commitRename(tmp, target string) error {
+func (s *Store) commitRename(tmp, target string) error {
 	if err := os.Rename(tmp, target); err != nil {
-		_ = os.Remove(tmp)
+		s.removeTemp(tmp)
 		return fmt.Errorf("commit %q: %w", target, err)
 	}
-	return syncDir(filepath.Dir(target))
+	return s.syncDir(filepath.Dir(target))
 }
 
 // commitLink is commitRename for a file that must not already exist. link(2)
 // fails with EEXIST instead of clobbering, which is how append-only is
 // enforced by the filesystem rather than by a check the caller could race.
-func commitLink(tmp, target string) error {
+func (s *Store) commitLink(tmp, target string) error {
 	err := os.Link(tmp, target)
-	_ = os.Remove(tmp)
+	s.removeTemp(tmp)
 	if err != nil {
 		return err
 	}
-	return syncDir(filepath.Dir(target))
+	return s.syncDir(filepath.Dir(target))
+}
+
+func (s *Store) ensureThreadDirs(orgID, projectID, threadID string) (bool, error) {
+	threadDir := filepath.Join(layout.ThreadsDir(s.dataDir, orgID, projectID), threadID)
+	created, err := mkdir(threadDir, dirMode)
+	if err != nil {
+		return false, err
+	}
+	if created {
+		if err := s.syncDir(filepath.Dir(threadDir)); err != nil {
+			return true, err
+		}
+	}
+
+	messagesDir := filepath.Join(threadDir, layout.MessagesDirName)
+	messagesCreated, err := mkdir(messagesDir, dirMode)
+	if err != nil {
+		return created, err
+	}
+	if messagesCreated {
+		if err := s.syncDir(threadDir); err != nil {
+			return created, err
+		}
+	}
+	return created, nil
+}
+
+func mkdir(path string, mode os.FileMode) (bool, error) {
+	if err := os.Mkdir(path, mode); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			info, statErr := os.Stat(path)
+			if statErr != nil {
+				return false, fmt.Errorf("stat %q: %w", path, statErr)
+			}
+			if info.IsDir() {
+				return false, nil
+			}
+		}
+		return false, fmt.Errorf("create %q: %w", path, err)
+	}
+	return true, nil
+}
+
+func (s *Store) removeTemp(path string) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		s.log.Warn("failed to clean temporary file", "path", path, "err", err)
+	}
+}
+
+func (s *Store) scavengeTemps() {
+	root := layout.OrgsRoot(s.dataDir)
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.Type().IsRegular() && strings.HasPrefix(entry.Name(), tempPrefix) {
+			if err := os.Remove(path); err != nil {
+				s.log.Warn("failed to scavenge temporary file", "path", path, "err", err)
+			}
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		s.log.Warn("failed to scan for temporary files", "path", root, "err", err)
+	}
 }
 
 // syncDir flushes a directory entry so a rename or link survives a crash.
