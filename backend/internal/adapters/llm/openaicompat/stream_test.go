@@ -89,6 +89,8 @@ data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}
 
 data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]},"finish_reason":"tool_calls"}]}
 
+data: {"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":3}}
+
 data: [DONE]
 `
 	events, err := collect(t, body)
@@ -112,14 +114,13 @@ func TestStreamEdgeCases(t *testing.T) {
 		body    string
 		want    []ports.StreamEvent
 		wantErr string
+		wantIs  error
 	}{
 		{
-			name: "no done marker still finishes",
-			body: "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n",
-			want: []ports.StreamEvent{
-				{Kind: ports.StreamText, Text: "hi"},
-				{Kind: ports.StreamDone, FinishReason: "stop"},
-			},
+			name:    "finish reason without the requested usage is truncated",
+			body:    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n",
+			wantErr: "ended before the model finished",
+			wantIs:  ErrTruncatedStream,
 		},
 		{
 			name: "usage only",
@@ -130,48 +131,51 @@ func TestStreamEdgeCases(t *testing.T) {
 		},
 		{
 			name: "null content is not a delta",
-			body: "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null}}]}\n\ndata: [DONE]\n",
+			body: "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":null}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}\n\ndata: [DONE]\n",
 			want: []ports.StreamEvent{{Kind: ports.StreamDone}},
 		},
 		{
 			name: "crlf line endings",
-			body: "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\r\n\r\ndata: [DONE]\r\n",
+			body: "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\r\n\r\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\r\n\r\ndata: [DONE]\r\n",
 			want: []ports.StreamEvent{
 				{Kind: ports.StreamText, Text: "a"},
-				{Kind: ports.StreamDone},
+				{Kind: ports.StreamDone, Usage: ports.Usage{InputTokens: 1, OutputTokens: 1}},
 			},
 		},
 		{
-			name: "unnamed tool call fragment is dropped",
-			body: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n",
-			want: []ports.StreamEvent{{Kind: ports.StreamDone}},
+			name:    "unnamed accumulated tool call is malformed",
+			body:    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"x\",\"function\":{\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n",
+			wantErr: "missing function name",
+			wantIs:  ErrMalformedToolCall,
 		},
 		{
 			name: "argument-less call becomes an empty object",
-			body: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"x\",\"function\":{\"name\":\"T\"}}]}}]}\n\ndata: [DONE]\n",
+			body: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"x\",\"function\":{\"name\":\"T\"}}]}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n",
 			want: []ports.StreamEvent{
 				{Kind: ports.StreamToolCall, ToolCall: ports.ToolCall{ID: "x", Name: "T", Arguments: []byte("{}")}},
-				{Kind: ports.StreamDone},
+				{Kind: ports.StreamDone, Usage: ports.Usage{InputTokens: 1, OutputTokens: 1}},
 			},
 		},
 		{
 			// Half a JSON object is half an instruction. Dispatching the tool
 			// with what did arrive is how a search becomes a delete.
 			name:    "half-received arguments fail the turn",
-			body:    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"x\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"rm -rf /tm\"}}]}}]}\n\ndata: [DONE]\n",
+			body:    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"x\",\"function\":{\"name\":\"Bash\",\"arguments\":\"{\\\"command\\\":\\\"rm -rf /tm\"}}]}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n",
 			wantErr: "arguments are not valid JSON",
+			wantIs:  ErrMalformedToolCall,
 		},
 		{
 			name:    "a body that stops without an ending marker is truncated",
 			body:    "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"}}]}\n\n",
 			wantErr: "ended before the model finished",
+			wantIs:  ErrTruncatedStream,
 		},
 		{
 			name: "a fragment carrying only arguments continues the call in flight",
-			body: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"x\",\"function\":{\"name\":\"T\",\"arguments\":\"{\\\"a\\\":\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n",
+			body: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"x\",\"function\":{\"name\":\"T\",\"arguments\":\"{\\\"a\\\":\"}}]}}]}\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n",
 			want: []ports.StreamEvent{
 				{Kind: ports.StreamToolCall, ToolCall: ports.ToolCall{ID: "x", Name: "T", Arguments: []byte(`{"a":1}`)}},
-				{Kind: ports.StreamDone, FinishReason: "tool_calls"},
+				{Kind: ports.StreamDone, Usage: ports.Usage{InputTokens: 1, OutputTokens: 1}, FinishReason: "tool_calls"},
 			},
 		},
 		{
@@ -192,6 +196,9 @@ func TestStreamEdgeCases(t *testing.T) {
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("Err() = %v, want it to contain %q", err, tc.wantErr)
+				}
+				if tc.wantIs != nil && !errors.Is(err, tc.wantIs) {
+					t.Fatalf("Err() = %v, want errors.Is(_, %v)", err, tc.wantIs)
 				}
 				// Deltas already handed over cannot be unsent, but a failed
 				// stream must never claim it finished.
@@ -231,6 +238,8 @@ func TestStreamKeepsIndexlessCallsOutOfTheIndexedSlots(t *testing.T) {
 data: {"choices":[{"delta":{"tool_calls":[{"id":"loose","function":{"name":"Loose","arguments":"{\"n\":9}"}}]}}]}
 
 data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","function":{"name":"One","arguments":"{\"n\":1}"}}]},"finish_reason":"tool_calls"}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":3}}
 
 data: [DONE]
 `
@@ -281,6 +290,62 @@ func TestStreamUsageSurvivesAFailure(t *testing.T) {
 		t.Fatalf("Usage() = %+v, want the tokens the provider reported", got)
 	}
 }
+
+func TestStreamAssemblesMultiLineDataEvent(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\n" +
+		"data: \"content\":\"joined\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\n" +
+		"data: [DONE]\n\n"
+
+	events, err := collect(t, body)
+	if err != nil {
+		t.Fatalf("Err() = %v, want nil", err)
+	}
+	if len(events) != 2 || events[0].Kind != ports.StreamText || events[0].Text != "joined" ||
+		events[1].Kind != ports.StreamDone || events[1].Usage != (ports.Usage{InputTokens: 2, OutputTokens: 1}) ||
+		events[1].FinishReason != "stop" {
+		t.Fatalf("events = %+v, want joined text and a metered done event", events)
+	}
+}
+
+func TestStreamHandlesByteAtATimeUTF8(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"সুস্থ\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1}}\n\n" +
+		"data: [DONE]\n\n"
+	s := newStream(&oneByteReader{data: []byte(body)})
+	defer s.Close()
+
+	var text strings.Builder
+	for {
+		ev, ok := s.Next()
+		if !ok {
+			break
+		}
+		if ev.Kind == ports.StreamText {
+			text.WriteString(ev.Text)
+		}
+	}
+	if err := s.Err(); err != nil {
+		t.Fatalf("Err() = %v, want nil", err)
+	}
+	if got := text.String(); got != "সুস্থ" {
+		t.Fatalf("text = %q, want %q", got, "সুস্থ")
+	}
+}
+
+type oneByteReader struct {
+	data []byte
+	pos  int
+}
+
+func (r *oneByteReader) Read(p []byte) (int, error) {
+	if r.pos >= len(r.data) {
+		return 0, io.EOF
+	}
+	p[0] = r.data[r.pos]
+	r.pos++
+	return 1, nil
+}
+
+func (r *oneByteReader) Close() error { return nil }
 
 // failingReader fails partway through, standing in for a connection that died.
 type failingReader struct {

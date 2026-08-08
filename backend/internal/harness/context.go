@@ -2,9 +2,11 @@ package harness
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/sifatulrabbi/protean/backend/internal/ports"
@@ -88,11 +90,14 @@ func (b *ContextBuilder) SystemPrompt(in ContextInput) string {
 // agentsDocs concatenates the org and project behavior documents.
 func (b *ContextBuilder) agentsDocs(in ContextInput) string {
 	var parts []string
-	for _, path := range []string{
-		layout.OrgAgentsMD(b.dataDir, in.OrgID),
-		layout.ProjectAgentsMD(b.dataDir, in.OrgID, in.ProjectID),
+	for _, file := range []struct {
+		root string
+		path string
+	}{
+		{layout.OrgDir(b.dataDir, in.OrgID), layout.OrgAgentsMD(b.dataDir, in.OrgID)},
+		{layout.ProjectDir(b.dataDir, in.OrgID, in.ProjectID), layout.ProjectAgentsMD(b.dataDir, in.OrgID, in.ProjectID)},
 	} {
-		if text := b.readFile(path); text != "" {
+		if text := b.readFile(file.root, file.path); text != "" {
 			parts = append(parts, text)
 		}
 	}
@@ -102,11 +107,17 @@ func (b *ContextBuilder) agentsDocs(in ContextInput) string {
 // memories renders the project and user memory files.
 func (b *ContextBuilder) memories(in ContextInput) string {
 	var parts []string
-	if text := b.readFile(layout.ProjectMemoryPath(b.dataDir, in.OrgID, in.ProjectID)); text != "" {
+	if text := b.readFile(
+		layout.ProjectMemoryDir(b.dataDir, in.OrgID, in.ProjectID),
+		layout.ProjectMemoryPath(b.dataDir, in.OrgID, in.ProjectID),
+	); text != "" {
 		parts = append(parts, projectMemHead+"\n\n"+text)
 	}
 	if in.UserID != "" {
-		if text := b.readFile(layout.UserMemoryPath(b.dataDir, in.OrgID, in.UserID)); text != "" {
+		if text := b.readFile(
+			layout.UserMemoryDir(b.dataDir, in.OrgID, in.UserID),
+			layout.UserMemoryPath(b.dataDir, in.OrgID, in.UserID),
+		); text != "" {
 			parts = append(parts, userMemHead+"\n\n"+text)
 		}
 	}
@@ -180,7 +191,14 @@ type SkillMeta struct {
 // which skills apply — is S9's; every installed skill is listed for now.
 func (b *ContextBuilder) listSkills(orgID string) []SkillMeta {
 	root := layout.SkillsDir(b.dataDir, orgID)
-	entries, err := os.ReadDir(root)
+	resolvedRoot, err := b.containedPath(layout.OrgDir(b.dataDir, orgID), root)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			b.log.Warn("cannot list skills", "org_id", orgID, "path", root, "err", err)
+		}
+		return nil
+	}
+	entries, err := os.ReadDir(resolvedRoot)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			b.log.Warn("cannot list skills", "org_id", orgID, "path", root, "err", err)
@@ -194,7 +212,7 @@ func (b *ContextBuilder) listSkills(orgID string) []SkillMeta {
 			continue
 		}
 		path := layout.SkillPath(b.dataDir, orgID, e.Name())
-		data, err := os.ReadFile(path)
+		data, err := b.readFileBytes(layout.SkillDir(b.dataDir, orgID, e.Name()), path)
 		if err != nil {
 			if !errors.Is(err, fs.ErrNotExist) {
 				b.log.Warn("cannot read skill", "org_id", orgID, "skill", e.Name(), "err", err)
@@ -310,9 +328,10 @@ func unquote(v string) string {
 	return v
 }
 
-// readFile returns a trimmed file body, or "" when it is missing or unreadable.
-func (b *ContextBuilder) readFile(path string) string {
-	data, err := os.ReadFile(path)
+// readFile returns a trimmed file body, or "" when it is missing, unreadable,
+// or resolves outside root.
+func (b *ContextBuilder) readFile(root, path string) string {
+	data, err := b.readFileBytes(root, path)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
 			b.log.Warn("cannot read context file", "path", path, "err", err)
@@ -320,4 +339,53 @@ func (b *ContextBuilder) readFile(path string) string {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
+}
+
+func (b *ContextBuilder) readFileBytes(root, path string) ([]byte, error) {
+	resolved, err := b.containedPath(root, path)
+	if err != nil {
+		return nil, err
+	}
+	return os.ReadFile(resolved)
+}
+
+// containedPath resolves symlinks in both root and path, then proves the file
+// remains below the intended tenant scope before it is opened.
+func (b *ContextBuilder) containedPath(root, path string) (string, error) {
+	resolvedDataDir, err := filepath.EvalSymlinks(b.dataDir)
+	if err != nil {
+		return "", err
+	}
+	absDataDir, err := filepath.Abs(b.dataDir)
+	if err != nil {
+		return "", err
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	rootRel, err := filepath.Rel(absDataDir, absRoot)
+	if err != nil || rootRel == ".." || strings.HasPrefix(rootRel, ".."+string(filepath.Separator)) || filepath.IsAbs(rootRel) {
+		return "", fmt.Errorf("context root %q escapes data directory %q", root, b.dataDir)
+	}
+	expectedRoot := filepath.Clean(filepath.Join(resolvedDataDir, rootRel))
+	resolvedRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	if resolvedRoot != expectedRoot {
+		return "", fmt.Errorf("context root %q escapes its tenant scope", root)
+	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(resolvedRoot, resolvedPath)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("context path %q escapes root %q", path, root)
+	}
+	return resolvedPath, nil
 }

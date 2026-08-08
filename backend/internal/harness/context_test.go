@@ -218,6 +218,61 @@ func TestSystemPromptSectionOrder(t *testing.T) {
 	}
 }
 
+func TestSystemPromptSkipsContextSymlinksOutsideTheirRoots(t *testing.T) {
+	tests := []struct {
+		name string
+		link func(dataDir string) string
+		body string
+	}{
+		{
+			name: "AGENTS.md",
+			link: func(dataDir string) string { return layout.OrgAgentsMD(dataDir, testOrg) },
+			body: "ESCAPED AGENT RULES",
+		},
+		{
+			name: "memory",
+			link: func(dataDir string) string { return layout.ProjectMemoryPath(dataDir, testOrg, testProject) },
+			body: "ESCAPED MEMORY",
+		},
+		{
+			name: "SKILL.md",
+			link: func(dataDir string) string { return layout.SkillPath(dataDir, testOrg, "escaped-skill") },
+			body: "---\nname: escaped-skill\ndescription: ESCAPED SKILL\n---\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs bytes.Buffer
+			dataDir := t.TempDir()
+			if err := layout.EnsureProject(dataDir, testOrg, testProject); err != nil {
+				t.Fatalf("EnsureProject: %v", err)
+			}
+			outside := t.TempDir() + "/outside.md"
+			writeFile(t, outside, tc.body)
+			link := tc.link(dataDir)
+			if err := os.MkdirAll(dirOf(link), 0o755); err != nil {
+				t.Fatalf("mkdir link parent: %v", err)
+			}
+			if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
+				t.Fatalf("remove existing context file: %v", err)
+			}
+			if err := os.Symlink(outside, link); err != nil {
+				t.Fatalf("symlink: %v", err)
+			}
+
+			b := NewContextBuilder(dataDir, slog.New(slog.NewTextHandler(&logs, nil)))
+			got := b.SystemPrompt(defaultInput())
+			if strings.Contains(got, "ESCAPED") {
+				t.Fatalf("escaped file reached system prompt: %q", got)
+			}
+			if !strings.Contains(logs.String(), "escapes root") {
+				t.Fatalf("escape was not logged: %s", logs.String())
+			}
+		})
+	}
+}
+
 func TestParseSkillFrontmatter(t *testing.T) {
 	tests := []struct {
 		name            string

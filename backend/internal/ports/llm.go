@@ -113,6 +113,15 @@ type ChatStream interface {
 	Close() error
 }
 
+// UsageReportingStream is the optional extension implemented by adapters that
+// can distinguish a provider-reported zero count from no usage report at all.
+// Harnesses use it to settle zero-token reservations without mistaking a
+// truncated stream for a free invocation.
+type UsageReportingStream interface {
+	ChatStream
+	UsageReported() bool
+}
+
 // LLMProvider is the model port. Implementations must abort the request when
 // ctx is cancelled and must never log or return the API key they authenticate
 // with (D11).

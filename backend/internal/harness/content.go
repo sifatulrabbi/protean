@@ -101,6 +101,17 @@ func DecodeContent(raw json.RawMessage) ([]Block, error) {
 	if c.Version > ContentVersion {
 		return nil, fmt.Errorf("%w: %d", ErrUnsupportedSchema, c.Version)
 	}
+	for i, block := range c.Blocks {
+		switch block.Type {
+		case BlockToolCall, BlockToolResult:
+			if strings.TrimSpace(block.ToolCallID) == "" {
+				return nil, fmt.Errorf("%w: block %d has no tool call id", ErrInvalidContent, i)
+			}
+			if strings.TrimSpace(block.ToolName) == "" {
+				return nil, fmt.Errorf("%w: block %d has no tool name", ErrInvalidContent, i)
+			}
+		}
+	}
 	return c.Blocks, nil
 }
 
@@ -151,9 +162,33 @@ func MessagesToChat(msgs []ports.Message) ([]ports.ChatMessage, error) {
 		if err != nil {
 			return nil, fmt.Errorf("message %s: %w", m.ID, err)
 		}
+		if err := validateRoleBlocks(m.Role, blocks); err != nil {
+			return nil, fmt.Errorf("message %s: %w", m.ID, err)
+		}
 		out = append(out, blocksToChat(m.Role, blocks)...)
 	}
 	return out, nil
+}
+
+func validateRoleBlocks(role string, blocks []Block) error {
+	for i, block := range blocks {
+		coherent := false
+		switch block.Type {
+		case BlockText:
+			coherent = role == ports.RoleUser || role == ports.RoleAssistant
+		case BlockToolCall:
+			coherent = role == ports.RoleAssistant
+		case BlockToolResult:
+			coherent = role == ports.RoleTool
+		default:
+			// Unknown kinds remain forward-compatible and are skipped.
+			continue
+		}
+		if !coherent {
+			return fmt.Errorf("%w: %s role cannot contain %s block %d", ErrInvalidContent, role, block.Type, i)
+		}
+	}
+	return nil
 }
 
 func blocksToChat(role string, blocks []Block) []ports.ChatMessage {
@@ -197,7 +232,7 @@ func blocksToChat(role string, blocks []Block) []ports.ChatMessage {
 
 // UnansweredToolCallResult is what RepairToolCalls puts in place of a tool
 // result that was never written.
-const UnansweredToolCallResult = "Tool execution did not complete: the previous run ended before this call returned."
+const UnansweredToolCallResult = "The tool result was not recorded. The action may have completed; verify its outcome before retrying."
 
 // RepairToolCalls makes a conversation acceptable to the provider.
 //
@@ -212,6 +247,17 @@ const UnansweredToolCallResult = "Tool execution did not complete: the previous 
 // tool messages answering nothing are dropped. Nothing on disk changes — the
 // thread stays the honest record of what happened.
 func RepairToolCalls(msgs []ports.ChatMessage) []ports.ChatMessage {
+	occupied := make(map[string]bool)
+	for _, m := range msgs {
+		for _, call := range m.ToolCalls {
+			if call.ID != "" {
+				occupied[call.ID] = true
+			}
+		}
+	}
+	seenCalls := make(map[string]bool)
+	nextRepairID := 1
+
 	out := make([]ports.ChatMessage, 0, len(msgs))
 	for i := 0; i < len(msgs); i++ {
 		m := msgs[i]
@@ -219,6 +265,24 @@ func RepairToolCalls(msgs []ports.ChatMessage) []ports.ChatMessage {
 			// A tool message here answers no preceding call: the loop below
 			// consumes every legitimate one.
 			continue
+		}
+		m.ToolCalls = append([]ports.ToolCall(nil), m.ToolCalls...)
+		for j := range m.ToolCalls {
+			id := m.ToolCalls[j].ID
+			if id != "" && !seenCalls[id] {
+				seenCalls[id] = true
+				continue
+			}
+			for {
+				candidate := fmt.Sprintf("repaired-tool-call-%d", nextRepairID)
+				nextRepairID++
+				if !occupied[candidate] {
+					m.ToolCalls[j].ID = candidate
+					occupied[candidate] = true
+					seenCalls[candidate] = true
+					break
+				}
+			}
 		}
 		out = append(out, m)
 		if len(m.ToolCalls) == 0 {

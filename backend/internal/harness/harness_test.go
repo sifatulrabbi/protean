@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -37,13 +38,24 @@ type rig struct {
 
 func newRig(t *testing.T, provider *fakeProvider, maxTurns int) *rig {
 	t.Helper()
+	ent := newFakeEntitlements()
+	return newRigWithEntitlements(t, provider, maxTurns, ent, ent)
+}
+
+func newRigWithEntitlements(
+	t *testing.T,
+	provider *fakeProvider,
+	maxTurns int,
+	storageEnt *fakeEntitlements,
+	harnessEnt ports.Entitlements,
+) *rig {
+	t.Helper()
 
 	dataDir := t.TempDir()
 	clock := newFakeClock(t, "2026-03-15T10:00:00Z")
-	ent := newFakeEntitlements()
 	threads := fsthreads.New(fsthreads.Options{
 		DataDir:      dataDir,
-		Entitlements: ent,
+		Entitlements: storageEnt,
 		Clock:        clock,
 		Logger:       discardLogger(),
 	})
@@ -58,7 +70,7 @@ func newRig(t *testing.T, provider *fakeProvider, maxTurns int) *rig {
 		DataDir:      dataDir,
 		Provider:     provider,
 		Threads:      threads,
-		Entitlements: ent,
+		Entitlements: harnessEnt,
 		Tools:        tools,
 		Clock:        clock,
 		Model:        "test/model",
@@ -69,7 +81,7 @@ func newRig(t *testing.T, provider *fakeProvider, maxTurns int) *rig {
 		t.Fatalf("New: %v", err)
 	}
 
-	return &rig{t: t, dataDir: dataDir, threads: threads, ent: ent, provider: provider, tools: tools, harness: h, thread: thread}
+	return &rig{t: t, dataDir: dataDir, threads: threads, ent: storageEnt, provider: provider, tools: tools, harness: h, thread: thread}
 }
 
 func (r *rig) run(ctx context.Context, message string) error {
@@ -444,6 +456,110 @@ func TestRunMetersUsageThatArrivedBeforeAStreamFailure(t *testing.T) {
 	if len(got) != 1 || got[0] != (ports.Usage{InputTokens: 40, OutputTokens: 9}) {
 		t.Errorf("recorded usage = %+v, want the tokens the provider reported", got)
 	}
+}
+
+func TestRunRetriesAndPersistsPendingUsage(t *testing.T) {
+	usage := ports.Usage{InputTokens: 40, OutputTokens: 9}
+	r := newRig(t, newFakeProvider(textTurn("done", usage)), 0)
+	r.ent.recordErr = errors.New("sqlite is closed")
+
+	if err := r.run(context.Background(), "hi"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := r.ent.records(); got != usageRecordAttempts {
+		t.Fatalf("RecordTokenUsage calls = %d, want %d", got, usageRecordAttempts)
+	}
+	record := readPendingUsage(t, r.dataDir)
+	if record.OrgID != testOrg || record.ThreadID != r.thread.ID || record.Turn != 1 ||
+		record.InputTokens != usage.InputTokens || record.OutputTokens != usage.OutputTokens || record.Method != "record" {
+		t.Fatalf("pending usage = %+v", record)
+	}
+}
+
+func TestRunUsesLLMReservationsForEveryProviderCall(t *testing.T) {
+	ent := newFakeReservingEntitlements()
+	provider := newFakeProvider(
+		toolTurn("", "call_1", "Echo", `{}`, ports.Usage{InputTokens: 10, OutputTokens: 2}),
+		textTurn("done", ports.Usage{InputTokens: 12, OutputTokens: 3}),
+	)
+	r := newRigWithEntitlements(t, provider, 0, ent.fakeEntitlements, ent)
+	r.tools.MustRegister(&echoTool{name: "Echo", result: "ok"})
+
+	if err := r.run(context.Background(), "go"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	reservations, releases, settled := ent.accounting()
+	if reservations != 2 || releases != 0 || len(settled) != 2 {
+		t.Fatalf("reservation accounting = reservations %d, releases %d, settled %+v", reservations, releases, settled)
+	}
+	if ent.checks() != 0 || ent.records() != 0 {
+		t.Fatalf("fallback accounting was used: checks %d records %d", ent.checks(), ent.records())
+	}
+}
+
+func TestRunReleasesReservationWhenProviderReturnsNoUsage(t *testing.T) {
+	ent := newFakeReservingEntitlements()
+	boom := errors.New("upstream is down")
+	r := newRigWithEntitlements(t, newFakeProvider(scriptedTurn{callErr: boom}), 0, ent.fakeEntitlements, ent)
+
+	if err := r.run(context.Background(), "go"); !errors.Is(err, boom) {
+		t.Fatalf("Run = %v, want %v", err, boom)
+	}
+	reservations, releases, settled := ent.accounting()
+	if reservations != 1 || releases != 1 || len(settled) != 0 {
+		t.Fatalf("reservation accounting = reservations %d, releases %d, settled %+v", reservations, releases, settled)
+	}
+}
+
+func TestRunSettlesReservationWhenUsagePrecedesStreamFailure(t *testing.T) {
+	ent := newFakeReservingEntitlements()
+	usage := ports.Usage{InputTokens: 40, OutputTokens: 9}
+	r := newRigWithEntitlements(t, newFakeProvider(scriptedTurn{
+		events: []ports.StreamEvent{{Kind: ports.StreamText, Text: "partial"}},
+		usage:  usage,
+		err:    errors.New("stream broke"),
+	}), 0, ent.fakeEntitlements, ent)
+
+	if err := r.run(context.Background(), "go"); err == nil {
+		t.Fatal("Run = nil, want stream failure")
+	}
+	_, releases, settled := ent.accounting()
+	if releases != 0 || len(settled) != 1 || settled[0] != usage {
+		t.Fatalf("reservation accounting = releases %d, settled %+v", releases, settled)
+	}
+}
+
+func TestRunPersistsPendingUsageWhenSettlementFails(t *testing.T) {
+	ent := newFakeReservingEntitlements()
+	ent.settleErr = errors.New("sqlite is closed")
+	usage := ports.Usage{InputTokens: 7, OutputTokens: 2}
+	r := newRigWithEntitlements(t, newFakeProvider(textTurn("done", usage)), 0, ent.fakeEntitlements, ent)
+
+	if err := r.run(context.Background(), "go"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	record := readPendingUsage(t, r.dataDir)
+	if record.Method != "settle" || record.InputTokens != usage.InputTokens || record.OutputTokens != usage.OutputTokens {
+		t.Fatalf("pending usage = %+v", record)
+	}
+}
+
+func readPendingUsage(t *testing.T, dataDir string) pendingUsageRecord {
+	t.Helper()
+	path := filepath.Join(layout.OrgProteanDir(dataDir, testOrg), pendingUsageFileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read pending usage: %v", err)
+	}
+	lines := strings.FieldsFunc(string(data), func(r rune) bool { return r == '\n' })
+	if len(lines) != 1 {
+		t.Fatalf("pending usage lines = %d, want 1: %s", len(lines), data)
+	}
+	var record pendingUsageRecord
+	if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
+		t.Fatalf("decode pending usage: %v", err)
+	}
+	return record
 }
 
 func TestRunTruncatesEventPreviews(t *testing.T) {

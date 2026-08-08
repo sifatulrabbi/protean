@@ -99,6 +99,10 @@ func TestDecodeContentRejections(t *testing.T) {
 		{"not json", `{`, ErrInvalidContent},
 		{"wrong shape", `{"v":"one"}`, ErrInvalidContent},
 		{"future schema", `{"v":99,"blocks":[]}`, ErrUnsupportedSchema},
+		{"tool call without id", `{"v":1,"blocks":[{"type":"tool_call","tool_name":"Grep","arguments":{}}]}`, ErrInvalidContent},
+		{"tool call without name", `{"v":1,"blocks":[{"type":"tool_call","tool_call_id":"c1","arguments":{}}]}`, ErrInvalidContent},
+		{"tool result without id", `{"v":1,"blocks":[{"type":"tool_result","tool_name":"Grep","result":"ok"}]}`, ErrInvalidContent},
+		{"tool result without name", `{"v":1,"blocks":[{"type":"tool_result","tool_call_id":"c1","result":"ok"}]}`, ErrInvalidContent},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -191,6 +195,26 @@ func TestMessagesToChatSplitsSeveralToolResults(t *testing.T) {
 	}
 }
 
+func TestMessagesToChatRejectsRoleKindMismatch(t *testing.T) {
+	tests := []struct {
+		name string
+		role string
+		raw  string
+	}{
+		{"user tool call", ports.RoleUser, `{"v":1,"blocks":[{"type":"tool_call","tool_call_id":"c1","tool_name":"T","arguments":{}}]}`},
+		{"assistant tool result", ports.RoleAssistant, `{"v":1,"blocks":[{"type":"tool_result","tool_call_id":"c1","tool_name":"T","result":"ok"}]}`},
+		{"tool text", ports.RoleTool, `{"v":1,"blocks":[{"type":"text","text":"ok"}]}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := MessagesToChat([]ports.Message{{ID: "m1", Role: tc.role, Content: json.RawMessage(tc.raw)}})
+			if !errors.Is(err, ErrInvalidContent) {
+				t.Fatalf("MessagesToChat = %v, want ErrInvalidContent", err)
+			}
+		})
+	}
+}
+
 func TestRepairToolCalls(t *testing.T) {
 	assistant := func(calls ...string) ports.ChatMessage {
 		m := ports.ChatMessage{Role: ports.RoleAssistant, Content: "working"}
@@ -255,6 +279,11 @@ func TestRepairToolCalls(t *testing.T) {
 			in:   []ports.ChatMessage{assistant("c1"), toolMsg("c1"), toolMsg("stale")},
 			want: []string{"assistant+c1", "tool=c1"},
 		},
+		{
+			name: "duplicate call ids are made unique and separately answered",
+			in:   []ports.ChatMessage{assistant("dup", "dup"), toolMsg("dup")},
+			want: []string{"assistant+dup+repaired-tool-call-1", "tool=dup", "tool=repaired-tool-call-1"},
+		},
 	}
 
 	for _, tc := range tests {
@@ -275,6 +304,25 @@ func TestRepairToolCalls(t *testing.T) {
 	repaired := RepairToolCalls([]ports.ChatMessage{assistant("c1")})
 	if repaired[1].Content != UnansweredToolCallResult {
 		t.Errorf("synthetic result = %q", repaired[1].Content)
+	}
+}
+
+func TestStoredDuplicateToolCallIDsAreRepaired(t *testing.T) {
+	raw := json.RawMessage(`{"v":1,"blocks":[{"type":"tool_call","tool_call_id":"dup","tool_name":"One","arguments":{}},{"type":"tool_call","tool_call_id":"dup","tool_name":"Two","arguments":{}}]}`)
+	chat, err := MessagesToChat([]ports.Message{{ID: "m1", Role: ports.RoleAssistant, Content: raw}})
+	if err != nil {
+		t.Fatalf("MessagesToChat: %v", err)
+	}
+	repaired := RepairToolCalls(chat)
+	if len(repaired) != 3 {
+		t.Fatalf("repaired = %+v, want an assistant and two results", repaired)
+	}
+	calls := repaired[0].ToolCalls
+	if len(calls) != 2 || calls[0].ID == "" || calls[1].ID == "" || calls[0].ID == calls[1].ID {
+		t.Fatalf("tool calls = %+v, want two unique ids", calls)
+	}
+	if repaired[1].ToolCallID != calls[0].ID || repaired[2].ToolCallID != calls[1].ID {
+		t.Fatalf("results = %+v, want one result per repaired call", repaired[1:])
 	}
 }
 

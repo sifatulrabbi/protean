@@ -18,6 +18,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"sync"
 
 	"github.com/sifatulrabbi/protean/backend/internal/ports"
 	"github.com/sifatulrabbi/protean/backend/internal/storage/layout"
@@ -27,6 +30,11 @@ import (
 // DefaultMaxTurns bounds one Run when Deps does not say otherwise. It is the
 // runaway guard, not a budget: the entitlements engine owns the budget.
 const DefaultMaxTurns = 40
+
+const (
+	usageRecordAttempts  = 3
+	pendingUsageFileName = "pending-llm-usage.jsonl"
+)
 
 // ToolErrorPrefix marks a tool result that reports a failure. The model reads
 // it, so it is words, not a code — and the loop keeps going, because a tool
@@ -70,6 +78,7 @@ type Harness struct {
 	model    string
 	maxTurns int
 	log      *slog.Logger
+	usageMu  sync.Mutex
 }
 
 // New builds a Harness. Every collaborator is required: a harness missing one
@@ -140,9 +149,10 @@ type RunSpec struct {
 // answers without calling a tool, when the turn budget runs out, when the
 // context is cancelled, or when the entitlements engine says no.
 //
-// Every provider call is preceded by CheckLLMInvocation and followed by
-// RecordTokenUsage, so an org that runs out of credits mid-conversation is
-// stopped at the next turn rather than at the next request.
+// Every provider call is preceded by a reservation when the entitlements
+// implementation supports it, or by CheckLLMInvocation otherwise. Reported
+// usage settles that reservation, with the check/record pair retained as the
+// backward-compatible fallback.
 func (h *Harness) Run(ctx context.Context, spec RunSpec) error {
 	emit := spec.Emit
 	if emit == nil {
@@ -168,25 +178,30 @@ func (h *Harness) Run(ctx context.Context, spec RunSpec) error {
 
 	// The balance is checked before anything is written, so an org with no
 	// credits does not even spend disk on a message it cannot answer.
-	if err := h.ent.CheckLLMInvocation(ctx, spec.OrgID); err != nil {
+	reservation, err := h.reserveInvocation(ctx, spec.OrgID)
+	if err != nil {
 		return fail(0, entitlementCode(err), entitlementMessage(err), err)
 	}
 
 	if _, err := h.persist(ctx, spec, emit, 0, ports.RoleUser, mustText(spec.UserMessage)); err != nil {
+		releaseReservation(reservation)
 		return fail(0, CodeStorageError, "Your message could not be saved.", err)
 	}
 
 	conv, err := h.history(ctx, spec)
 	if err != nil {
+		releaseReservation(reservation)
 		return fail(0, CodeStorageError, "This thread's history could not be read.", err)
 	}
 
 	for turn := 1; turn <= h.maxTurns; turn++ {
 		if err := ctx.Err(); err != nil {
+			releaseReservation(reservation)
 			return fail(turn, CodeCanceled, "The run was cancelled.", err)
 		}
 		if turn > 1 {
-			if err := h.ent.CheckLLMInvocation(ctx, spec.OrgID); err != nil {
+			reservation, err = h.reserveInvocation(ctx, spec.OrgID)
+			if err != nil {
 				return fail(turn, entitlementCode(err), entitlementMessage(err), err)
 			}
 		}
@@ -197,12 +212,14 @@ func (h *Harness) Run(ctx context.Context, spec RunSpec) error {
 		// on this).
 		system, err := h.systemPrompt(ctx, spec)
 		if err != nil {
+			releaseReservation(reservation)
 			return fail(turn, CodeStorageError, "This thread could not be opened.", err)
 		}
 
 		emit(Event{Type: EventTurnStarted, ThreadID: spec.ThreadID, Turn: turn})
 
-		result, err := h.invoke(ctx, spec, emit, turn, system, conv)
+		result, err := h.invoke(ctx, spec, emit, turn, system, conv, reservation)
+		reservation = nil // invoke always settles or releases its reservation.
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return fail(turn, CodeCanceled, "The run was cancelled.", ctxErr)
@@ -282,7 +299,15 @@ type turnResult struct {
 // failed — tokens the provider counted are tokens the org spent — which is why
 // it is read off the stream rather than off the terminating event a failed
 // stream never produces.
-func (h *Harness) invoke(ctx context.Context, spec RunSpec, emit func(Event), turn int, system string, conv []ports.ChatMessage) (turnResult, error) {
+func (h *Harness) invoke(
+	ctx context.Context,
+	spec RunSpec,
+	emit func(Event),
+	turn int,
+	system string,
+	conv []ports.ChatMessage,
+	reservation ports.LLMReservation,
+) (turnResult, error) {
 	var result turnResult
 
 	messages := make([]ports.ChatMessage, 0, len(conv)+1)
@@ -297,12 +322,14 @@ func (h *Harness) invoke(ctx context.Context, spec RunSpec, emit func(Event), tu
 		Tools:    h.tools.Defs(),
 	})
 	if err != nil {
+		releaseReservation(reservation)
 		return result, err
 	}
 	defer stream.Close()
 
 	var text []byte
 	seen := map[string]bool{}
+	sawDone := false
 	for {
 		ev, ok := stream.Next()
 		if !ok {
@@ -322,31 +349,131 @@ func (h *Harness) invoke(ctx context.Context, spec RunSpec, emit func(Event), tu
 			seen[call.ID] = true
 			result.calls = append(result.calls, call)
 		case ports.StreamDone:
+			sawDone = true
 			result.finishReason = ev.FinishReason
 		}
 	}
 	result.text = string(text)
 	result.usage = stream.Usage()
 
-	h.meter(ctx, spec, emit, turn, result.usage)
-	return result, stream.Err()
+	usageReported := sawDone || result.usage.InputTokens != 0 || result.usage.OutputTokens != 0
+	if reporting, ok := stream.(ports.UsageReportingStream); ok {
+		usageReported = reporting.UsageReported()
+	}
+	meterErr := h.meter(ctx, spec, emit, turn, reservation, result.usage, usageReported)
+	return result, errors.Join(stream.Err(), meterErr)
+}
+
+func (h *Harness) reserveInvocation(ctx context.Context, orgID string) (ports.LLMReservation, error) {
+	if ent, ok := h.ent.(ports.ReservingEntitlements); ok {
+		return ent.ReserveLLMInvocation(ctx, orgID)
+	}
+	return nil, h.ent.CheckLLMInvocation(ctx, orgID)
+}
+
+func releaseReservation(reservation ports.LLMReservation) {
+	if reservation != nil {
+		reservation.Release()
+	}
 }
 
 // meter reports the provider's token count to the entitlements engine. It uses
 // a context detached from the run: a cancelled run still spent its tokens, and
 // dropping them would let a caller cancel their way out of the bill.
-func (h *Harness) meter(ctx context.Context, spec RunSpec, emit func(Event), turn int, usage ports.Usage) {
-	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
-		return
+func (h *Harness) meter(
+	ctx context.Context,
+	spec RunSpec,
+	emit func(Event),
+	turn int,
+	reservation ports.LLMReservation,
+	usage ports.Usage,
+	usageReported bool,
+) error {
+	if !usageReported {
+		releaseReservation(reservation)
+		return nil
 	}
-	if err := h.ent.RecordTokenUsage(context.WithoutCancel(ctx), spec.OrgID, usage.InputTokens, usage.OutputTokens); err != nil {
-		// Accounting that failed is an operator problem, not a user problem:
-		// failing a completed call would be worse than under-counting it.
-		h.log.Error("token usage not recorded",
-			"org_id", spec.OrgID, "thread_id", spec.ThreadID, "turn", turn, "err", err)
-		return
+
+	accountingCtx := context.WithoutCancel(ctx)
+	var recordErr error
+	method := "record"
+	if reservation != nil {
+		method = "settle"
+		recordErr = reservation.Settle(accountingCtx, usage.InputTokens, usage.OutputTokens)
+		if recordErr != nil {
+			// Settle is single-use, but Release is idempotent and also covers an
+			// extension implementation that leaves its hold open on failure.
+			reservation.Release()
+		}
+	} else {
+		for attempt := 1; attempt <= usageRecordAttempts; attempt++ {
+			recordErr = h.ent.RecordTokenUsage(accountingCtx, spec.OrgID, usage.InputTokens, usage.OutputTokens)
+			if recordErr == nil {
+				break
+			}
+		}
 	}
-	emit(Event{Type: EventUsage, ThreadID: spec.ThreadID, Turn: turn, Usage: &usage})
+
+	if recordErr != nil {
+		trailErr := h.persistPendingUsage(spec, turn, usage, method, recordErr)
+		h.log.Error("token usage pending reconciliation",
+			"org_id", spec.OrgID, "thread_id", spec.ThreadID, "turn", turn,
+			"method", method, "err", recordErr, "trail_err", trailErr)
+		if trailErr != nil {
+			return errors.Join(recordErr, fmt.Errorf("persist pending token usage: %w", trailErr))
+		}
+		return nil
+	}
+	if usage.InputTokens != 0 || usage.OutputTokens != 0 {
+		emit(Event{Type: EventUsage, ThreadID: spec.ThreadID, Turn: turn, Usage: &usage})
+	}
+	return nil
+}
+
+type pendingUsageRecord struct {
+	ID           string `json:"id"`
+	OrgID        string `json:"org_id"`
+	ProjectID    string `json:"project_id"`
+	ThreadID     string `json:"thread_id"`
+	Turn         int    `json:"turn"`
+	InputTokens  int64  `json:"input_tokens"`
+	OutputTokens int64  `json:"output_tokens"`
+	Method       string `json:"method"`
+	Error        string `json:"error"`
+}
+
+func (h *Harness) persistPendingUsage(spec RunSpec, turn int, usage ports.Usage, method string, recordErr error) error {
+	record := pendingUsageRecord{
+		ID: h.ids.New(), OrgID: spec.OrgID, ProjectID: spec.ProjectID,
+		ThreadID: spec.ThreadID, Turn: turn,
+		InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens,
+		Method: method, Error: recordErr.Error(),
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	h.usageMu.Lock()
+	defer h.usageMu.Unlock()
+	dir := layout.OrgProteanDir(h.ctxb.dataDir, spec.OrgID)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(filepath.Join(dir, pendingUsageFileName), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := file.Write(data); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 // dispatch executes one tool call and persists its result.

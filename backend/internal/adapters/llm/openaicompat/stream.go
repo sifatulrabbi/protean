@@ -30,11 +30,10 @@ var (
 	// arrived is an unknown fraction of the answer, so it is not the answer.
 	ErrTruncatedStream = errors.New("openaicompat: stream ended before the model finished")
 
-	// ErrMalformedToolCall is a tool call whose accumulated arguments are not
-	// JSON. It fails the turn instead of dispatching the tool: the arguments
-	// that did arrive are a prefix of an unknown whole, and guessing at what
-	// the model meant is how a search becomes a delete.
-	ErrMalformedToolCall = errors.New("openaicompat: tool call arguments are not valid JSON")
+	// ErrMalformedToolCall is an incomplete tool call or one whose accumulated
+	// arguments are not JSON. It fails the turn instead of guessing at what the
+	// model meant.
+	ErrMalformedToolCall = errors.New("openaicompat: malformed tool call")
 )
 
 // stream is the pull iterator over one SSE response body.
@@ -49,8 +48,10 @@ type stream struct {
 
 	pending []ports.StreamEvent
 	acc     *toolCallAccumulator
+	data    []string
 
 	usage        ports.Usage
+	sawUsage     bool
 	finishReason string
 	sawDone      bool
 
@@ -60,6 +61,7 @@ type stream struct {
 }
 
 var _ ports.ChatStream = (*stream)(nil)
+var _ ports.UsageReportingStream = (*stream)(nil)
 
 func newStream(body io.ReadCloser) *stream {
 	return &stream{
@@ -88,6 +90,10 @@ func (s *stream) Next() (ports.StreamEvent, bool) {
 // Usage is what the provider reported, whether or not the stream then failed.
 func (s *stream) Usage() ports.Usage { return s.usage }
 
+// UsageReported distinguishes a real provider report containing zeroes from
+// the zero value left behind by a stream that ended before its usage event.
+func (s *stream) UsageReported() bool { return s.sawUsage }
+
 // Err reports why the stream stopped early, or nil when it ended cleanly.
 func (s *stream) Err() error { return s.err }
 
@@ -115,6 +121,12 @@ func (s *stream) readMore() {
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				if len(s.data) > 0 {
+					s.handleEvent()
+					if s.err != nil {
+						return
+					}
+				}
 				s.finish()
 				return
 			}
@@ -129,7 +141,7 @@ func (s *stream) handleLine(line string) bool {
 	line = strings.TrimRight(line, "\r\n")
 	switch {
 	case line == "":
-		return false
+		return s.handleEvent()
 	case strings.HasPrefix(line, ":"):
 		// A comment. OpenRouter sends these as keepalives while it queues.
 		return false
@@ -138,11 +150,21 @@ func (s *stream) handleLine(line string) bool {
 	field, value, ok := strings.Cut(line, ":")
 	if !ok || field != "data" {
 		// event:, id:, retry: and anything unknown carry nothing Protean needs.
-		// Several data: lines forming one event are not joined either: no
-		// provider Protean talks to splits a JSON chunk that way.
 		return false
 	}
-	payload := strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, " ")
+	s.data = append(s.data, value)
+	return false
+}
+
+// handleEvent assembles all data fields in one SSE event, joining them with a
+// newline as required by the event-stream format.
+func (s *stream) handleEvent() bool {
+	if len(s.data) == 0 {
+		return false
+	}
+	payload := strings.TrimSpace(strings.Join(s.data, "\n"))
+	s.data = nil
 	if payload == doneMarker {
 		s.sawDone = true
 		s.finish()
@@ -167,6 +189,7 @@ func (s *stream) handleChunk(c chunk) {
 		return
 	}
 	if c.Usage != nil {
+		s.sawUsage = true
 		s.usage = ports.Usage{
 			InputTokens:  c.Usage.PromptTokens,
 			OutputTokens: c.Usage.CompletionTokens,
@@ -195,10 +218,10 @@ func (s *stream) finish() {
 	if s.finished {
 		return
 	}
-	// A body that stopped without either ending marker was cut off. Reporting
-	// that as a complete answer is the one failure the caller cannot detect
-	// for itself.
-	if !s.sawDone && s.finishReason == "" {
+	// Usage was explicitly requested for every request made by this adapter.
+	// A finish reason can precede the separate usage event, so it is not enough
+	// to prove that the complete billable response arrived.
+	if !s.sawUsage || (!s.sawDone && s.finishReason == "") {
 		s.fail(ErrTruncatedStream)
 		return
 	}
@@ -301,12 +324,13 @@ func (a *toolCallAccumulator) builderFor(d toolCallDelta) *toolCallBuilder {
 }
 
 // calls returns the accumulated calls in the order they first appeared.
-// Fragments that never produced a name are dropped: they cannot be dispatched.
+// Any builder that never produced a function name is malformed. Dropping it
+// would make a tool-requesting turn look like a successful empty answer.
 func (a *toolCallAccumulator) calls() ([]ports.ToolCall, error) {
 	out := make([]ports.ToolCall, 0, len(a.order))
 	for _, b := range a.order {
 		if b.name == "" {
-			continue
+			return nil, fmt.Errorf("%w: missing function name", ErrMalformedToolCall)
 		}
 		args := strings.TrimSpace(b.args.String())
 		switch {
@@ -314,7 +338,7 @@ func (a *toolCallAccumulator) calls() ([]ports.ToolCall, error) {
 			// No arguments at all is what a parameterless tool looks like.
 			args = emptyArguments
 		case !json.Valid([]byte(args)):
-			return nil, fmt.Errorf("%w: %s", ErrMalformedToolCall, b.name)
+			return nil, fmt.Errorf("%w: %s arguments are not valid JSON", ErrMalformedToolCall, b.name)
 		}
 		out = append(out, ports.ToolCall{
 			ID:        b.id,

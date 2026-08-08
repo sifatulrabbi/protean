@@ -136,10 +136,11 @@ func (p *fakeProvider) calls() []ports.ChatRequest {
 // through after an error would make the harness's accounting look correct when
 // it is not.
 type fakeStream struct {
-	ctx  context.Context
-	turn scriptedTurn
-	i    int
-	err  error
+	ctx           context.Context
+	turn          scriptedTurn
+	i             int
+	err           error
+	usageReported bool
 }
 
 var _ ports.ChatStream = (*fakeStream)(nil)
@@ -161,10 +162,20 @@ func (s *fakeStream) Next() (ports.StreamEvent, bool) {
 	}
 	ev := s.turn.events[s.i]
 	s.i++
+	if ev.Kind == ports.StreamDone {
+		s.usageReported = true
+	}
 	return ev, true
 }
 
 func (s *fakeStream) Usage() ports.Usage { return s.turn.usage }
+
+func (s *fakeStream) UsageReported() bool {
+	if s.turn.usage.InputTokens != 0 || s.turn.usage.OutputTokens != 0 {
+		return true
+	}
+	return s.usageReported
+}
 
 func (s *fakeStream) Err() error { return s.err }
 
@@ -180,6 +191,7 @@ type fakeEntitlements struct {
 	rejectErr    error
 	usage        []ports.Usage
 	recordErr    error
+	recordCalls  int
 	diskWrites   int
 	diskWriteErr error
 }
@@ -203,6 +215,7 @@ func (f *fakeEntitlements) CheckLLMInvocation(context.Context, string) error {
 func (f *fakeEntitlements) RecordTokenUsage(_ context.Context, _ string, in, out int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.recordCalls++
 	if f.recordErr != nil {
 		return f.recordErr
 	}
@@ -239,6 +252,89 @@ func (f *fakeEntitlements) checks() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.llmChecks
+}
+
+func (f *fakeEntitlements) records() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.recordCalls
+}
+
+type fakeReservingEntitlements struct {
+	*fakeEntitlements
+
+	mu           sync.Mutex
+	reserveErr   error
+	settleErr    error
+	reservations int
+	releases     int
+	settled      []ports.Usage
+}
+
+var _ ports.ReservingEntitlements = (*fakeReservingEntitlements)(nil)
+
+func newFakeReservingEntitlements() *fakeReservingEntitlements {
+	return &fakeReservingEntitlements{fakeEntitlements: newFakeEntitlements()}
+}
+
+func (f *fakeReservingEntitlements) ReserveLLMInvocation(context.Context, string) (ports.LLMReservation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.reserveErr != nil {
+		return nil, f.reserveErr
+	}
+	f.reservations++
+	return &fakeLLMReservation{owner: f}, nil
+}
+
+func (f *fakeReservingEntitlements) ReserveMemberSlot(context.Context, string) (ports.StructuralAdmission, error) {
+	return nil, errors.New("unused")
+}
+
+func (f *fakeReservingEntitlements) ReserveOrgSlot(context.Context, string) (ports.StructuralAdmission, error) {
+	return nil, errors.New("unused")
+}
+
+func (f *fakeReservingEntitlements) ReserveProjectSlot(context.Context, string) (ports.StructuralAdmission, error) {
+	return nil, errors.New("unused")
+}
+
+type fakeLLMReservation struct {
+	owner  *fakeReservingEntitlements
+	closed bool
+}
+
+func (r *fakeLLMReservation) Settle(ctx context.Context, in, out int64) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	r.owner.mu.Lock()
+	defer r.owner.mu.Unlock()
+	if r.closed {
+		return errors.New("reservation already closed")
+	}
+	r.closed = true
+	if r.owner.settleErr != nil {
+		return r.owner.settleErr
+	}
+	r.owner.settled = append(r.owner.settled, ports.Usage{InputTokens: in, OutputTokens: out})
+	return nil
+}
+
+func (r *fakeLLMReservation) Release() {
+	r.owner.mu.Lock()
+	defer r.owner.mu.Unlock()
+	if r.closed {
+		return
+	}
+	r.closed = true
+	r.owner.releases++
+}
+
+func (f *fakeReservingEntitlements) accounting() (reservations, releases int, settled []ports.Usage) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reservations, f.releases, append([]ports.Usage(nil), f.settled...)
 }
 
 // echoTool answers with whatever the caller scripted for it.
