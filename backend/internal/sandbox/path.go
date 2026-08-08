@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"path"
 	"strings"
+
+	"github.com/sifatulrabbi/protean/backend/internal/storage/layout"
 )
 
 const (
@@ -17,12 +19,13 @@ const (
 
 	// ControlDirName is the per-project control directory. It holds threads,
 	// memories, and skills, and is masked inside the sandbox — no path handed
-	// to a sandbox may name it.
-	ControlDirName = ".protean"
+	// to a sandbox may name it. The storage layout owns the name; this is an
+	// alias so the mask and the guard can never drift apart.
+	ControlDirName = layout.ControlDirName
 
 	// AgentsFileName is mounted read-only inside the sandbox; its edits are
 	// approval-gated and land host-side (D5).
-	AgentsFileName = "AGENTS.md"
+	AgentsFileName = layout.AgentsFileName
 )
 
 // Path rejections. Match with errors.Is; the wrapped error names the offending

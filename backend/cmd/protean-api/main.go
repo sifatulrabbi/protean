@@ -11,6 +11,7 @@ import (
 	"github.com/sifatulrabbi/protean/backend/internal/adapters/entitlements/diskusage"
 	"github.com/sifatulrabbi/protean/backend/internal/adapters/entitlements/sqlitestore"
 	"github.com/sifatulrabbi/protean/backend/internal/adapters/sandbox/dockerbox"
+	"github.com/sifatulrabbi/protean/backend/internal/adapters/storage/fsthreads"
 	"github.com/sifatulrabbi/protean/backend/internal/config"
 	"github.com/sifatulrabbi/protean/backend/internal/entitlements"
 	"github.com/sifatulrabbi/protean/backend/internal/httpserver"
@@ -68,6 +69,17 @@ func run(logger *slog.Logger) error {
 		engine.Wait()
 	}()
 	engine.Start(watcherCtx)
+
+	// Threads live on disk under the data dir and count against the org's disk
+	// quota, so the store gets the same entitlements engine as everything else.
+	// Nothing serves it over HTTP yet; the harness slice consumes it.
+	threadStore := fsthreads.New(fsthreads.Options{
+		DataDir:      cfg.DataDir,
+		Entitlements: engine,
+		Clock:        systemClock,
+		Logger:       logger,
+	})
+	_ = threadStore
 
 	// The sandbox is the security boundary, so a boot without a healthy runtime
 	// is a failed boot: there is no unsandboxed fallback (D8).

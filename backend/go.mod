@@ -5,6 +5,7 @@ go 1.26.0
 require (
 	github.com/containerd/errdefs v1.0.0
 	github.com/moby/docker-image-spec v1.3.1
+	github.com/oklog/ulid/v2 v2.1.2
 	github.com/opencontainers/image-spec v1.1.1
 	golang.org/x/sys v0.47.0
 	modernc.org/sqlite v1.56.0

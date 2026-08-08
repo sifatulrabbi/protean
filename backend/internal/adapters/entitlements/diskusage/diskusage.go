@@ -11,11 +11,8 @@ import (
 	"path/filepath"
 
 	"github.com/sifatulrabbi/protean/backend/internal/entitlements"
+	"github.com/sifatulrabbi/protean/backend/internal/storage/layout"
 )
-
-// OrgsDirName is the directory under the data dir that holds one subdirectory
-// per organization.
-const OrgsDirName = "protean-organizations"
 
 type FS struct {
 	dataDir string
@@ -26,10 +23,10 @@ var _ entitlements.DiskUsage = FS{}
 func New(dataDir string) FS { return FS{dataDir: filepath.Clean(dataDir)} }
 
 // OrgsDir is the root of all organization trees.
-func (f FS) OrgsDir() string { return filepath.Join(f.dataDir, OrgsDirName) }
+func (f FS) OrgsDir() string { return layout.OrgsRoot(f.dataDir) }
 
 // OrgDir is one organization's tree.
-func (f FS) OrgDir(orgID string) string { return filepath.Join(f.OrgsDir(), orgID) }
+func (f FS) OrgDir(orgID string) string { return layout.OrgDir(f.dataDir, orgID) }
 
 // OrgUsageBytes sums the apparent size of every regular file in the org tree.
 // A missing tree is zero bytes, not an error: an org with no data yet is
